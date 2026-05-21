@@ -1,0 +1,4 @@
+Django>=4.2,<5
+playwright>=1.40
+beautifulsoup4>=4.12
+fake-useragent>=1.4

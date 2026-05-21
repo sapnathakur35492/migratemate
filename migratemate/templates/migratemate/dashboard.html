@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>USA Job Scraper | MigrateMate</title>
+  <style>
+    :root { --bg: #0f0d18; --card: #1a1628; --accent: #6951f4; --text: #f1f5f9; --muted: #c4b5fd; --ok: #22c55e; --warn: #eab308; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem; }
+    h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+    .sub { color: #94a3b8; margin-bottom: 1.25rem; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
+    button { border: none; padding: 0.6rem 1.2rem; border-radius: 8px; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-start { background: var(--ok); color: #052e16; }
+    .btn-stop { background: #ef4444; color: #fff; }
+    .btn-resume { background: var(--warn); color: #1c1917; }
+    .btn-clear { background: #64748b; color: #fff; }
+    .status { background: var(--card); padding: 1rem; border-radius: 10px; margin-bottom: 1rem; font-size: 0.9rem; line-height: 1.6; border-left: 4px solid var(--accent); }
+    .status strong { color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #2d2640; }
+    th { background: #2a2438; font-size: 0.8rem; text-transform: uppercase; color: #94a3b8; }
+    tr:hover { background: #252033; }
+    a.apply { background: var(--accent); color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 600; }
+    .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; background: #3b2f4a; }
+    .running { color: var(--ok); }
+    .stopped { color: var(--warn); }
+    .pagination { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 1rem; justify-content: center; }
+    .pagination button { background: var(--card); color: var(--text); border: 1px solid #3b2f4a; padding: 0.45rem 0.9rem; }
+    .empty { text-align: center; padding: 2rem; color: #94a3b8; }
+    .note { font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem; }
+    .toast-wrap {
+      position: fixed; top: 1rem; right: 1rem; z-index: 9999;
+      display: flex; flex-direction: column; gap: 0.5rem; max-width: 380px;
+    }
+    .toast {
+      padding: 0.85rem 1rem; border-radius: 10px; font-size: 0.9rem; line-height: 1.45;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.45); animation: toast-in 0.25s ease;
+      border: 1px solid #3b2f4a;
+    }
+    .toast.ok { background: #14532d; border-color: #22c55e; color: #dcfce7; }
+    .toast.err { background: #450a0a; border-color: #ef4444; color: #fee2e2; }
+    .toast.info { background: #431407; border-color: var(--accent); color: #ffedd5; }
+    @keyframes toast-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000;
+      align-items: center; justify-content: center;
+    }
+    .modal-backdrop.show { display: flex; }
+    .modal-box {
+      background: var(--card); padding: 1.25rem 1.5rem; border-radius: 12px; max-width: 400px;
+      border: 1px solid #3b2f4a;
+    }
+    .modal-box h3 { margin: 0 0 0.75rem; }
+    .modal-box p { margin: 0 0 1rem; color: #94a3b8; font-size: 0.9rem; }
+    .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+  </style>
+</head>
+<body>
+  <h1>MigrateMate — USA Scraper</h1>
+  <p class="sub">Standalone · port <strong>8002</strong> · migratemate.co · Last {{ max_age_hours }}h · USA · ATS / company apply only · {{ keywords_count }} search passes</p>
+  <p class="note"><strong>Start</strong> = delete all jobs + keyword 1. <strong>Resume</strong> = continue where stopped (no duplicates). Never LinkedIn.</p>
+  <p class="note">Run: <code>python manage.py runserver 8002 --noreload</code> → <strong>http://127.0.0.1:8002/</strong></p>
+
+  <div class="toolbar">
+    <button class="btn-start" id="btn-start">Start Scraper</button>
+    <button class="btn-stop" id="btn-stop">Stop Scraper</button>
+    <button class="btn-resume" id="btn-resume">Resume Scraper</button>
+    <button class="btn-clear" id="btn-clear">Clear All Jobs</button>
+    <span class="badge" id="live-badge">Live</span>
+  </div>
+
+  <div class="status" id="status-panel">
+    <div>Status: <strong id="st-status">{{ state.status }}</strong></div>
+    <div>Keyword: <strong id="st-keyword">{{ state.current_keyword|default:"—" }}</strong>
+      (<span id="st-kidx">0</span> / <span id="st-ktotal">{{ keywords_count }}</span> done)</div>
+    <div>Saved: <strong id="st-saved">{{ state.jobs_saved }}</strong> · Skipped: <strong id="st-skipped">{{ state.jobs_skipped }}</strong> · DB total: <strong id="st-total">{{ job_count }}</strong></div>
+    <div id="st-msg">{{ state.last_message }}</div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Company</th>
+        <th>Location</th>
+        <th>Posted</th>
+        <th>Keyword</th>
+        <th>Source</th>
+        <th>Apply</th>
+      </tr>
+    </thead>
+    <tbody id="job-body"></tbody>
+  </table>
+
+  <div class="pagination" id="pagination"></div>
+
+  <div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+
+  <div class="modal-backdrop" id="confirm-modal">
+    <div class="modal-box">
+      <h3>Clear all jobs?</h3>
+      <p>Delete every MigrateMate job from the database. This cannot be undone.</p>
+      <div class="modal-actions">
+        <button type="button" class="btn-clear" id="confirm-cancel">Cancel</button>
+        <button type="button" class="btn-stop" id="confirm-ok">Delete all</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API = "/api";
+    const csrf = "{{ csrf_token }}";
+    let currentPage = 1;
+    let totalPages = 1;
+    let scraperRunning = false;
+    let pollTimer = null;
+
+    function post(url) {
+      return fetch(url, {
+        method: "POST",
+        headers: { "X-CSRFToken": csrf },
+      }).then(r => r.json());
+    }
+
+    function showToast(message, type) {
+      const wrap = document.getElementById("toast-wrap");
+      const el = document.createElement("div");
+      el.className = "toast " + (type || "info");
+      el.textContent = message;
+      wrap.appendChild(el);
+      setTimeout(() => {
+        el.style.opacity = "0";
+        el.style.transition = "opacity 0.3s";
+        setTimeout(() => el.remove(), 300);
+      }, 4500);
+    }
+
+    function confirmClear() {
+      return new Promise(resolve => {
+        const modal = document.getElementById("confirm-modal");
+        modal.classList.add("show");
+        const done = ok => {
+          modal.classList.remove("show");
+          document.getElementById("confirm-ok").onclick = null;
+          document.getElementById("confirm-cancel").onclick = null;
+          modal.onclick = null;
+          resolve(ok);
+        };
+        document.getElementById("confirm-ok").onclick = () => done(true);
+        document.getElementById("confirm-cancel").onclick = () => done(false);
+        modal.onclick = e => { if (e.target === modal) done(false); };
+      });
+    }
+
+    function setButtons(running) {
+      scraperRunning = running;
+      document.getElementById("btn-start").disabled = running;
+      document.getElementById("btn-stop").disabled = !running;
+      document.getElementById("btn-resume").disabled = running;
+      document.getElementById("btn-clear").disabled = running;
+      document.getElementById("live-badge").textContent = running ? "Scraping…" : "Live";
+    }
+
+    document.getElementById("btn-start").onclick = () => {
+      post(`${API}/scraper/start/`).then(d => {
+        if (d.ok) {
+          currentPage = 1;
+          setButtons(true);
+          startPolling();
+          loadJobs(1);
+        }
+        refreshStatus().then(() => showToast(d.message, d.ok ? "ok" : "err"));
+      });
+    };
+
+    document.getElementById("btn-stop").onclick = () => {
+      post(`${API}/scraper/stop/`).then(d => {
+        setButtons(false);
+        stopPolling();
+        refreshStatus().then(() => showToast(d.message, d.ok ? "info" : "err"));
+      });
+    };
+
+    document.getElementById("btn-resume").onclick = () => {
+      post(`${API}/scraper/resume/`).then(d => {
+        refreshStatus().then(() => {
+          showToast(d.message, d.ok ? "ok" : "err");
+          if (d.ok) {
+            setButtons(true);
+            startPolling();
+            loadJobs(currentPage);
+          }
+        });
+      });
+    };
+
+    document.getElementById("btn-clear").onclick = async () => {
+      if (!(await confirmClear())) return;
+      post(`${API}/jobs/clear/`).then(d => {
+        showToast(d.message, d.ok ? "ok" : "err");
+        if (d.ok) {
+          currentPage = 1;
+          loadJobs(1);
+          refreshStatus();
+        }
+      });
+    };
+
+    function refreshStatus() {
+      return fetch(`${API}/status/`)
+        .then(r => r.json())
+        .then(d => {
+          const running = d.running;
+          setButtons(running);
+          document.getElementById("st-status").textContent = d.status;
+          document.getElementById("st-status").className = running ? "running" : (d.status === "stopped" ? "stopped" : "");
+          document.getElementById("st-keyword").textContent = d.current_keyword || "—";
+          document.getElementById("st-kidx").textContent = d.keywords_done != null ? d.keywords_done : d.keyword_index;
+          document.getElementById("st-ktotal").textContent = d.keywords_total;
+          document.getElementById("st-saved").textContent = d.jobs_saved;
+          document.getElementById("st-skipped").textContent = d.jobs_skipped;
+          document.getElementById("st-total").textContent = d.job_count;
+          document.getElementById("st-msg").textContent = d.last_message || "";
+          if (!running && pollTimer) stopPolling();
+        });
+    }
+
+    function loadJobs(page) {
+      currentPage = page;
+      return fetch(`${API}/jobs/?page=${page}`)
+        .then(r => r.json())
+        .then(d => {
+          totalPages = Math.max(1, d.total_pages);
+          const tbody = document.getElementById("job-body");
+          tbody.innerHTML = "";
+          if (!d.jobs.length) {
+            tbody.innerHTML = '<tr><td colspan="7" class="empty">No jobs yet. Click Start Scraper.</td></tr>';
+          } else {
+            d.jobs.forEach(j => {
+              const tr = document.createElement("tr");
+              tr.innerHTML = `
+                <td>${esc(j.title)}</td>
+                <td>${esc(j.company)}</td>
+                <td>${esc(j.location)}</td>
+                <td>${esc(j.posted_time)}</td>
+                <td><span class="badge">${esc(j.keyword)}</span></td>
+                <td>${esc(j.source)}</td>
+                <td><a class="apply" href="${esc(j.apply_url)}" target="_blank" rel="noopener noreferrer">Apply</a></td>`;
+              tbody.appendChild(tr);
+            });
+          }
+          renderPagination(d);
+        });
+    }
+
+    function renderPagination(d) {
+      const el = document.getElementById("pagination");
+      if (d.total === 0) {
+        el.innerHTML = "";
+        return;
+      }
+      let html = `<button id="pg-prev" ${!d.has_previous ? "disabled" : ""}>← Prev</button>`;
+      html += `<span class="info">Page ${d.page} of ${d.total_pages} (${d.total} jobs)</span>`;
+      html += `<button id="pg-next" ${!d.has_next ? "disabled" : ""}>Next →</button>`;
+      el.innerHTML = html;
+      document.getElementById("pg-prev").onclick = () => { if (currentPage > 1) loadJobs(currentPage - 1); };
+      document.getElementById("pg-next").onclick = () => { if (currentPage < totalPages) loadJobs(currentPage + 1); };
+    }
+
+    function esc(s) {
+      const div = document.createElement("div");
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    function startPolling() {
+      stopPolling();
+      pollTimer = setInterval(() => {
+        refreshStatus().then(() => {
+          if (scraperRunning) loadJobs(currentPage);
+        });
+      }, 3000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    loadJobs(1);
+    refreshStatus().then(() => {
+      fetch(`${API}/status/`).then(r => r.json()).then(s => {
+        if (s.running) startPolling();
+      });
+    });
+    setInterval(() => {
+      if (!scraperRunning) refreshStatus();
+    }, 5000);
+  </script>
+</body>
+</html>
