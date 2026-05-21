@@ -1,7 +1,36 @@
-db.sqlite3
-logs/
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
 .venv/
 venv/
+env/
+
+# Django / local data
+db.sqlite3
+db.sqlite3-journal
+*.sqlite3
+*.sqlite3-journal
+
+# Logs & runtime
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+
+# Local probes (dev only)
+_probe*.py
