@@ -1,10 +1,11 @@
-"""Adzuna USA job scraper (replaces MigrateMate). Port 8002."""
+"""Adzuna USA job scraper (replaces MigrateMate). Port 8000."""
 import logging
 import os
 import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from difflib import SequenceMatcher
 from urllib.parse import quote
@@ -13,8 +14,16 @@ import requests
 from django.conf import settings
 from django.db import IntegrityError, close_old_connections
 
-from migratemate_site.apply_live import is_apply_url_live
-from migratemate_site.apply_urls import is_blocked_apply_host, is_valid_apply_url as _valid_apply
+from migratemate_site.apply_live import (
+    is_apply_url_live,
+    is_apply_url_live_relaxed,
+    trust_board_api_url,
+)
+from migratemate_site.apply_urls import (
+    is_blocked_apply_host,
+    is_relaxed_apply_url,
+    is_valid_apply_url as _valid_apply,
+)
 from migratemate_site.scraper_process import (
     clear_stop_flag,
     is_stop_requested,
@@ -38,9 +47,20 @@ USER_AGENT = (
 
 JOBS_PER_PAGE = 20
 RESULTS_PER_PAGE = int(getattr(settings, "ADZUNA_RESULTS_PER_PAGE", 50))
-MAX_PAGES = int(getattr(settings, "ADZUNA_MAX_PAGES_PER_KEYWORD", 40))
+MAX_PAGES = int(getattr(settings, "ADZUNA_MAX_PAGES_PER_KEYWORD", 50))
 MAX_DAYS_OLD = int(getattr(settings, "ADZUNA_MAX_DAYS_OLD", 1))
 DEFAULT_WHERE = getattr(settings, "ADZUNA_DEFAULT_WHERE", "United States")
+VOLUME_MODE = bool(getattr(settings, "ADZUNA_VOLUME_MODE", True))
+
+
+def _volume_mode():
+    return VOLUME_MODE
+
+
+def is_valid_apply_url(url, company_url=""):
+    if _volume_mode() and is_relaxed_apply_url(url, ATS_DOMAINS, company_url=company_url):
+        return True
+    return _valid_apply(url, ATS_DOMAINS, company_url=company_url)
 
 EXPERIENCE_HARD_BLOCK = (
     "director",
@@ -66,10 +86,79 @@ ATS_URL_IN_TEXT = re.compile(
     r"https?://[^\s\"'<>\\]+?(?:"
     r"greenhouse\.io|lever\.co|myworkdayjobs\.com|myworkdaysite\.com|"
     r"ashbyhq\.com|smartrecruiters\.com|icims\.com|jobvite\.com|"
-    r"oraclecloud\.com|workable\.com|recruitee\.com|bamboohr\.com"
+    r"oraclecloud\.com|workable\.com|recruitee\.com|bamboohr\.com|"
+    r"jobs\.apple\.com|amazon\.jobs|careers\.microsoft\.com"
     r")[^\s\"'<>\\]*",
     re.I,
 )
+
+GH_JID_RE = re.compile(r"gh_jid[=:\"'](\d+)", re.I)
+GH_BOARD_RE = re.compile(
+    r"(?:boards\.greenhouse\.io|job-boards\.greenhouse\.io)/([a-z0-9_-]+)/jobs",
+    re.I,
+)
+
+# Tech keywords → Adzuna category filter (fewer irrelevant medical/non-tech ads)
+IT_KEYWORD_HINTS = (
+    "engineer",
+    "developer",
+    "software",
+    "data",
+    "devops",
+    "analyst",
+    "qa",
+    "sdet",
+    "sre",
+    "cloud",
+    "java",
+    "python",
+    "react",
+    "android",
+    "ios",
+    ".net",
+    "sql",
+    "etl",
+    "machine learning",
+    "ai ",
+    "gen ai",
+    "security",
+    "cyber",
+    "network",
+    "embedded",
+    "sap",
+    "salesforce",
+    "platform",
+    "blockchain",
+    "robotics",
+    "graphics",
+    "aws",
+    "typescript",
+    "javascript",
+    "golang",
+)
+
+KNOWN_GREENHOUSE_BOARDS = {
+    "spacex": "spacex",
+    "space exploration technologies": "spacex",
+    "anduril": "andurilindustries",
+    "anduril industries": "andurilindustries",
+    "stripe": "stripe",
+    "coinbase": "coinbase",
+    "databricks": "databricks",
+    "figma": "figma",
+    "notion": "notion",
+    "verkada": "verkada",
+    "anduril industries": "andurilindustries",
+    "natera": "natera",
+    "endor labs": "endorlabs",
+    "endorlabs": "endorlabs",
+}
+
+_cache_lock = threading.Lock()
+
+
+def _apply_workers():
+    return int(getattr(settings, "ADZUNA_APPLY_WORKERS", 6))
 
 
 def _should_stop():
@@ -79,10 +168,6 @@ def _should_stop():
 def is_scraper_running():
     state = MigratemateScraperState.get_singleton()
     return pid_is_alive(state.worker_pid)
-
-
-def is_valid_apply_url(url, company_url=""):
-    return _valid_apply(url, ATS_DOMAINS, company_url=company_url)
 
 
 NON_US_AREA_NAMES = frozenset(
@@ -172,7 +257,11 @@ def is_experience_0_to_5(title, description=""):
     blob = f"{title} {description}".lower()
     if any(h in blob for h in EXPERIENCE_HARD_BLOCK):
         return False
-    if re.search(r"\b([6-9]|1[0-9]|20)\+?\s*(?:years?|yrs?)\b", blob):
+    if re.search(r"\b(1[0-9]|20)\+?\s*(?:years?|yrs?)\b", blob):
+        return False
+    if _volume_mode():
+        return True
+    if re.search(r"\b([6-9])\s*\+?\s*(?:years?|yrs?)\b", blob):
         return False
     if re.search(r"\b(?:minimum|min\.?|at least)\s*([6-9]|1[0-9])\s*(?:years?|yrs?)\b", blob):
         return False
@@ -214,32 +303,67 @@ def _title_match_score(want, found):
 def _board_tokens(company):
     company = (company or "").strip()
     tokens = []
-    slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
-    if slug and len(slug) >= 4:
+    low = company.lower()
+    for key, board in KNOWN_GREENHOUSE_BOARDS.items():
+        if key in low:
+            tokens.append(board)
+    slug = re.sub(r"[^a-z0-9]+", "-", low).strip("-")
+    for suffix in ("-inc", "-llc", "-corp", "-ltd", "-co"):
+        if slug.endswith(suffix):
+            slug = slug[: -len(suffix)]
+    if slug and len(slug) >= 3:
         tokens.extend([slug, slug.replace("-", "")])
-    clean = re.sub(r"[^a-z0-9]", "", company.lower())
+    first = slug.split("-")[0] if slug else ""
+    if first and len(first) >= 4:
+        tokens.append(first)
+    clean = re.sub(r"[^a-z0-9]", "", low)
     if clean and len(clean) >= 4:
         tokens.append(clean)
-    return list(dict.fromkeys(t for t in tokens if t))
+    return list(dict.fromkeys(t for t in tokens if t and len(t) >= 3))
 
 
-def _greenhouse_apply(session, job_title, company, gh_cache, min_score=0.62):
+def _adzuna_category_query(keyword):
+    kw = keyword.lower()
+    if any(h in kw for h in IT_KEYWORD_HINTS):
+        return "&category=it-jobs"
+    return ""
+
+
+def _gh_urls_from_text(text):
+    urls = []
+    if not text:
+        return urls
+    board = None
+    m = GH_BOARD_RE.search(text)
+    if m:
+        board = m.group(1)
+    for jid in GH_JID_RE.findall(text):
+        if board:
+            urls.append(f"https://boards.greenhouse.io/{board}/jobs/{jid}")
+            urls.append(f"https://job-boards.greenhouse.io/{board}/jobs/{jid}")
+    return urls
+
+
+def _greenhouse_apply(session, job_title, company, gh_cache, min_score=0.48):
     best_url = None
     best_score = 0.0
-    for token in _board_tokens(company)[:5]:
+    for token in _board_tokens(company)[:8]:
         if _should_stop():
             break
-        if token in gh_cache:
-            jobs = gh_cache[token]
+        with _cache_lock:
+            cached = gh_cache.get(token)
+        if cached is not None:
+            jobs = cached
         else:
             jobs = None
             try:
-                r = session.get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout=10)
+                r = session.get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout=8)
                 if r.status_code < 400:
                     jobs = r.json().get("jobs") or []
             except Exception:
                 pass
-            gh_cache[token] = jobs
+            with _cache_lock:
+                gh_cache[token] = jobs
         if not jobs:
             continue
         for job in jobs:
@@ -252,24 +376,27 @@ def _greenhouse_apply(session, job_title, company, gh_cache, min_score=0.62):
     return None
 
 
-def _lever_apply(session, job_title, company, lever_cache, min_score=0.58):
+def _lever_apply(session, job_title, company, lever_cache, min_score=0.46):
     best_url = None
     best_score = 0.0
-    for token in _board_tokens(company)[:5]:
+    for token in _board_tokens(company)[:8]:
         if _should_stop():
             break
-        if token in lever_cache:
-            posts = lever_cache[token]
+        with _cache_lock:
+            cached = lever_cache.get(token)
+        if cached is not None:
+            posts = cached
         else:
             posts = None
             try:
-                r = session.get(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout=10)
+                r = session.get(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout=8)
                 if r.status_code < 400:
                     data = r.json()
                     posts = data if isinstance(data, list) else []
             except Exception:
                 pass
-            lever_cache[token] = posts
+            with _cache_lock:
+                lever_cache[token] = posts
         if not posts:
             continue
         for post in posts:
@@ -285,11 +412,20 @@ def _lever_apply(session, job_title, company, lever_cache, min_score=0.58):
 def _collect_redirect_candidates(session, redirect_url):
     candidates = []
     try:
-        resp = session.get(redirect_url, allow_redirects=True, timeout=15)
+        resp = session.get(redirect_url, allow_redirects=True, timeout=10, stream=True)
         final = (resp.url or "").strip()
         if final and not is_blocked_apply_host(final) and is_valid_apply_url(final):
             candidates.append(final)
-        text = (resp.text or "")[:120000]
+        chunks = []
+        size = 0
+        for chunk in resp.iter_content(8192):
+            if chunk:
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= 100000:
+                    break
+        text = b"".join(chunks).decode("utf-8", errors="ignore")
+        candidates.extend(_gh_urls_from_text(text))
         for m in ATS_URL_IN_TEXT.finditer(text):
             u = m.group(0).rstrip(".,;)'\"")
             if not is_blocked_apply_host(u) and is_valid_apply_url(u):
@@ -303,33 +439,92 @@ def _collect_redirect_candidates(session, redirect_url):
     return candidates
 
 
-def _pick_live_apply(session, candidates):
+def _live_ok(session, url):
+    if _volume_mode():
+        return is_apply_url_live_relaxed(session, url, ATS_DOMAINS)
+    return is_apply_url_live(session, url, ATS_DOMAINS)
+
+
+def _follow_redirect_final(session, redirect_url):
+    try:
+        resp = session.get(redirect_url, allow_redirects=True, timeout=8)
+        return (resp.url or "").strip()
+    except Exception:
+        return ""
+
+
+def _pick_live_apply(session, candidates, api_trusted=None):
+    api_trusted = api_trusted or set()
     seen = set()
     for url in candidates:
-        if not url or url in seen:
+        if not url or url in seen or "adzuna." in url.lower():
             continue
         seen.add(url)
-        if "adzuna." in url.lower():
+        if not is_valid_apply_url(url):
             continue
-        if is_apply_url_live(session, url, ATS_DOMAINS):
+        if url in api_trusted and trust_board_api_url(session, url, ATS_DOMAINS):
+            return url
+        if _live_ok(session, url):
             return url
     return None
 
 
-def _resolve_apply_url(session, redirect_url, job_title, company, gh_cache, lever_cache):
-    if not redirect_url:
-        return None
-    candidates = _collect_redirect_candidates(session, redirect_url)
-    found = _pick_live_apply(session, candidates)
+def _resolve_apply_url(session, redirect_url, job_title, company, gh_cache, lever_cache, description=""):
+    """Volume mode: redirect + GH/Lever + description — save max valid employer apply links."""
+    candidates = []
+    api_trusted = set()
+
+    if redirect_url:
+        final = _follow_redirect_final(session, redirect_url)
+        if final and not is_blocked_apply_host(final):
+            candidates.append(final)
+
+    gh = _greenhouse_apply(session, job_title, company, gh_cache)
+    if gh:
+        candidates.append(gh)
+        api_trusted.add(gh)
+    lev = _lever_apply(session, job_title, company, lever_cache)
+    if lev:
+        candidates.append(lev)
+        api_trusted.add(lev)
+
+    for m in ATS_URL_IN_TEXT.finditer(description or ""):
+        u = m.group(0).rstrip(".,;)'\"")
+        if not is_blocked_apply_host(u):
+            candidates.append(u)
+    candidates.extend(_gh_urls_from_text(description or ""))
+
+    if redirect_url:
+        candidates.extend(_collect_redirect_candidates(session, redirect_url))
+
+    found = _pick_live_apply(session, candidates, api_trusted=api_trusted)
     if found:
         return found
-    gh = _greenhouse_apply(session, job_title, company, gh_cache)
-    if gh and is_apply_url_live(session, gh, ATS_DOMAINS):
-        return gh
-    lev = _lever_apply(session, job_title, company, lever_cache)
-    if lev and is_apply_url_live(session, lev, ATS_DOMAINS):
-        return lev
+
+    if _volume_mode() and redirect_url:
+        final = _follow_redirect_final(session, redirect_url)
+        if final and is_valid_apply_url(final) and _live_ok(session, final):
+            return final
     return None
+
+
+def _make_session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json,text/html"})
+    return s
+
+
+def _resolve_apply_worker(item, gh_cache, lever_cache):
+    session = _make_session()
+    return item, _resolve_apply_url(
+        session,
+        item["redirect"],
+        item["title"],
+        item["company"],
+        gh_cache,
+        lever_cache,
+        item.get("description") or "",
+    )
 
 
 def _parse_created_ts(created_str):
@@ -400,7 +595,8 @@ class AdzunaScraper:
             f"&what={quote(keyword)}&where={quote(DEFAULT_WHERE)}"
             f"&results_per_page={RESULTS_PER_PAGE}&max_days_old={MAX_DAYS_OLD}"
             f"&sort_by=date&content-type=application/json"
-            f"&what_exclude={quote('senior director principal vp chief')}"
+            f"&what_exclude={quote('director vp chief executive') if _volume_mode() else quote('senior director principal vp chief')}"
+            f"{_adzuna_category_query(keyword) if not _volume_mode() else ''}"
         )
         try:
             resp = session.get(url, timeout=45)
@@ -437,84 +633,95 @@ class AdzunaScraper:
             )
             logger.info("[%s/%s] %s page %s: %s ads", ki + 1, total, keyword, page_num, len(results))
 
+            pending = []
             for ad in results:
                 if _should_stop():
                     raise StopIteration
-
                 job_id = str(ad.get("id") or "")
                 if not job_id or job_id in self.processed:
                     continue
                 if not is_usa_job(ad.get("location")):
                     continue
-
                 title = (ad.get("title") or "").strip()
                 description = ad.get("description") or ""
                 if not is_experience_0_to_5(title, description):
                     continue
-
                 posted_ts = _parse_created_ts(ad.get("created"))
                 if not posted_ts or not is_within_24h_timestamp(posted_ts):
                     continue
-
                 posted_label = format_posted_time(posted_ts)
                 if not posted_label:
                     continue
-
                 company = (ad.get("company") or {}).get("display_name") or ""
                 company = company.strip() or "Unknown"
                 loc = ad.get("location") or {}
                 location = (loc.get("display_name") or "").strip() or "United States"
                 if not is_usa_location_string(location):
                     continue
+                pending.append(
+                    {
+                        "job_id": job_id,
+                        "title": title,
+                        "company": company,
+                        "location": location,
+                        "posted_label": posted_label,
+                        "posted_ts": posted_ts,
+                        "redirect": ad.get("redirect_url") or "",
+                        "description": description,
+                    }
+                )
 
-                redirect = ad.get("redirect_url") or ""
-                desc = ad.get("description") or ""
-                desc_candidates = []
-                for m in ATS_URL_IN_TEXT.finditer(desc):
-                    u = m.group(0).rstrip(".,;)'\"")
-                    if not is_blocked_apply_host(u) and is_valid_apply_url(u):
-                        desc_candidates.append(u)
-                apply_url = _pick_live_apply(session, desc_candidates)
-                if not apply_url:
-                    apply_url = _resolve_apply_url(
-                        session, redirect, title, company, self._gh_cache, self._lever_cache
-                    )
-                if not apply_url:
-                    self.processed.add(job_id)
-                    self.state.jobs_skipped += 1
-                    logger.info("Skipped (no valid ATS): %s @ %s", title, company)
-                    self._save_state(jobs_skipped=self.state.jobs_skipped)
-                    continue
-
-                if job_exists(title, company, location, apply_url, adzuna_job_id=job_id):
-                    self.processed.add(job_id)
-                    self.state.jobs_skipped += 1
-                    self._save_state(jobs_skipped=self.state.jobs_skipped)
-                    continue
-
-                close_old_connections()
-                try:
-                    MigratemateJob.objects.create(
-                        title=title,
-                        company=company,
-                        location=location,
-                        apply_url=apply_url,
-                        source="Adzuna",
-                        keyword=keyword,
-                        posted_time=posted_label,
-                        posted_at=posted_ts,
-                        migratemate_job_id=job_id,
-                    )
-                except IntegrityError:
-                    self.processed.add(job_id)
-                    self.state.jobs_skipped += 1
-                    self._save_state(jobs_skipped=self.state.jobs_skipped)
-                    continue
-
-                self.processed.add(job_id)
-                self.state.jobs_saved += 1
-                self._save_state(jobs_saved=self.state.jobs_saved)
-                logger.info("Saved: %s @ %s (%s)", title, company, posted_label)
+            if pending and not _should_stop():
+                workers = min(_apply_workers(), len(pending))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(_resolve_apply_worker, item, self._gh_cache, self._lever_cache)
+                        for item in pending
+                    ]
+                    for fut in as_completed(futures):
+                        if _should_stop():
+                            raise StopIteration
+                        item, apply_url = fut.result()
+                        job_id = item["job_id"]
+                        if not apply_url:
+                            self.processed.add(job_id)
+                            self.state.jobs_skipped += 1
+                            logger.info("Skipped (no valid ATS): %s @ %s", item["title"], item["company"])
+                            self._save_state(jobs_skipped=self.state.jobs_skipped)
+                            continue
+                        if job_exists(
+                            item["title"],
+                            item["company"],
+                            item["location"],
+                            apply_url,
+                            adzuna_job_id=job_id,
+                        ):
+                            self.processed.add(job_id)
+                            self.state.jobs_skipped += 1
+                            self._save_state(jobs_skipped=self.state.jobs_skipped)
+                            continue
+                        close_old_connections()
+                        try:
+                            MigratemateJob.objects.create(
+                                title=item["title"],
+                                company=item["company"],
+                                location=item["location"],
+                                apply_url=apply_url,
+                                source="Adzuna",
+                                keyword=keyword,
+                                posted_time=item["posted_label"],
+                                posted_at=item["posted_ts"],
+                                migratemate_job_id=job_id,
+                            )
+                        except IntegrityError:
+                            self.processed.add(job_id)
+                            self.state.jobs_skipped += 1
+                            self._save_state(jobs_skipped=self.state.jobs_skipped)
+                            continue
+                        self.processed.add(job_id)
+                        self.state.jobs_saved += 1
+                        self._save_state(jobs_saved=self.state.jobs_saved)
+                        logger.info("Saved: %s @ %s (%s)", item["title"], item["company"], item["posted_label"])
 
             page_num += 1
             self._human_delay(0.1, 0.2)

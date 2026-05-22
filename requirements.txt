@@ -1,3 +1,3 @@
-# Adzuna USA Job Scraper — Python 3.10+
+# Adzuna USA Job Scraper — port 8000 — Python 3.10+
 Django>=4.2,<5
 requests>=2.31,<3

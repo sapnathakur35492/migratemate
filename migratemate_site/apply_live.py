@@ -2,7 +2,11 @@
 import re
 from urllib.parse import urlparse
 
-from migratemate_site.apply_urls import is_blocked_apply_host, is_valid_apply_url
+from migratemate_site.apply_urls import (
+    is_blocked_apply_host,
+    is_relaxed_apply_url,
+    is_valid_apply_url,
+)
 
 DEAD_PAGE_MARKERS = (
     "page not found",
@@ -24,7 +28,7 @@ DEAD_PAGE_MARKERS = (
 
 def page_body_is_dead(body_low):
     if not body_low:
-        return True
+        return False
     return any(m in body_low for m in DEAD_PAGE_MARKERS)
 
 
@@ -114,8 +118,49 @@ def is_apply_url_live(session, url, ats_domains, company_url=""):
         if is_blocked_apply_host(final) or not is_valid_apply_url(final, ats_domains, company_url=company_url):
             return False
         if resp.request.method == "GET":
-            if page_body_is_dead((resp.text or "").lower()[:25000]):
+            body = (resp.text or "").lower()[:25000]
+            if body and page_body_is_dead(body):
                 return False
         return True
     except Exception:
         return False
+
+
+def is_apply_url_live_relaxed(session, url, ats_domains, company_url=""):
+    """Fast check for volume mode — HEAD only, accepts relaxed employer URLs."""
+    if not url or not str(url).startswith("http"):
+        return False
+    if is_blocked_apply_host(url) or not is_relaxed_apply_url(url, ats_domains, company_url=company_url):
+        return False
+    low = url.lower()
+    if "lever.co" in low:
+        return lever_posting_live(session, url)
+    if "greenhouse.io" in low:
+        return greenhouse_job_live(session, url)
+    try:
+        resp = session.head(url, allow_redirects=True, timeout=8)
+        if resp.status_code >= 400 or resp.status_code == 405:
+            resp = session.get(url, allow_redirects=True, timeout=10)
+        if resp.status_code >= 400:
+            return False
+        final = resp.url or url
+        if is_blocked_apply_host(final):
+            return False
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if ctype.startswith("image/"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def trust_board_api_url(session, url, ats_domains):
+    """Fast accept for Greenhouse/Lever URLs returned by board APIs."""
+    if not url or not is_valid_apply_url(url, ats_domains):
+        return False
+    low = url.lower()
+    if "lever.co" in low:
+        return lever_posting_live(session, url)
+    if "greenhouse.io" in low:
+        return greenhouse_job_live(session, url)
+    return False

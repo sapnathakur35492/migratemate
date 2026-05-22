@@ -163,6 +163,69 @@ def _is_ats_url(url, ats_domains):
     return False
 
 
+def is_pure_board_ats_host(url):
+    """Third-party job boards (not the company's own careers domain)."""
+    host = _host(url)
+    return "greenhouse.io" in host or "lever.co" in host
+
+
+def _company_name_tokens(company):
+    company = (company or "").strip().lower()
+    if not company:
+        return []
+    slug = re.sub(r"[^a-z0-9]+", "-", company).strip("-")
+    tokens = []
+    if slug and len(slug) >= 3:
+        tokens.append(slug.replace("-", ""))
+        tokens.append(slug.split("-")[0])
+    clean = re.sub(r"[^a-z0-9]", "", company)
+    if clean and len(clean) >= 4:
+        tokens.append(clean)
+    return list(dict.fromkeys(t for t in tokens if len(t) >= 3))
+
+
+def _host_matches_company_name(host, company):
+    if not company or not host:
+        return False
+    h = host.replace("www.", "", 1).replace("-", "").replace(".", "")
+    for token in _company_name_tokens(company):
+        if token in h:
+            return True
+    return False
+
+
+def is_company_career_apply_url(url, ats_domains, company=""):
+    """
+    Company's own careers site (e.g. careers.acme.com, acme.com/jobs/123).
+    Excludes boards.greenhouse.io and jobs.lever.co.
+    """
+    if not url or not is_valid_apply_url(url, ats_domains):
+        return False
+    if is_pure_board_ats_host(url):
+        return False
+    host = _host(url)
+    if host.startswith("careers.") or host.startswith("jobs.") or ".careers." in host:
+        return True
+    if company and _host_matches_company_name(host, company) and _has_career_segment(url):
+        return True
+    if _host_matches_company_name(host, company) and re.search(
+        r"/(jobs?|careers?|positions?|openings?)/[^/]{4,}",
+        urlparse(url).path,
+        re.I,
+    ):
+        return True
+    return False
+
+
+def apply_url_priority(url, ats_domains, company=""):
+    """0 = company career page, 1 = hosted ATS (Workday etc.), 2 = GH/Lever board."""
+    if is_company_career_apply_url(url, ats_domains, company=company):
+        return 0
+    if is_pure_board_ats_host(url):
+        return 2
+    return 1
+
+
 def _is_employer_platform_url(url):
     host = _host(url)
     for part in EMPLOYER_PLATFORM_HOST_PARTS:
@@ -213,7 +276,7 @@ def is_specific_job_apply_url(url):
         return bool(re.search(r"/jobs/\d+", low))
     if "lever.co" in low:
         if len(segs) >= 2 and segs[-1] not in GENERIC_CAREER_SLUGS:
-            return len(segs[-1]) >= 8
+            return len(segs[-1]) >= 6
         return False
     if "ashbyhq.com" in low:
         if len(segs) >= 2 and segs[-1] not in GENERIC_CAREER_SLUGS:
@@ -244,6 +307,30 @@ def is_specific_job_apply_url(url):
                 return True
             return len(last) >= 15 and re.search(r"\d{3,}", last)
         return False
+    return False
+
+
+def is_relaxed_apply_url(url, ats_domains, company_url=""):
+    """
+    Volume mode: accept company career pages, ATS hosts, and employer apply paths
+    (not Indeed/LinkedIn/Adzuna). Less strict than is_specific_job_apply_url alone.
+    """
+    if not url or not str(url).strip().startswith("http"):
+        return False
+    url = url.strip()
+    if is_blocked_apply_host(url) or _IMAGE_EXT.search(url.lower()):
+        return False
+    if is_valid_apply_url(url, ats_domains, company_url=company_url):
+        return True
+    host = _host(url)
+    if _is_ats_url(url, ats_domains) or _is_employer_platform_url(url):
+        return True
+    if _has_career_segment(url):
+        return True
+    if re.search(r"/(job|jobs|career|careers|apply|position|opening|requisition)s?/", url, re.I):
+        return True
+    if company_url and _host_on_company_domain(host, company_url):
+        return True
     return False
 
 

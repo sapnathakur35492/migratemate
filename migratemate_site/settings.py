@@ -86,7 +86,7 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-RUNSERVER_PORT = 8002
+RUNSERVER_PORT = 8000
 
 # Adzuna API (register at https://developer.adzuna.com/signup)
 ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "")
@@ -96,7 +96,10 @@ ADZUNA_RESULTS_PER_PAGE = 50
 ADZUNA_MAX_PAGES_PER_KEYWORD = 50
 ADZUNA_MAX_DAYS_OLD = 1
 ADZUNA_DEFAULT_WHERE = "United States"
+ADZUNA_APPLY_WORKERS = 12
 ADZUNA_API_BASE = "https://api.adzuna.com/v1/api"
+# Max jobs: relaxed apply rules (career page OR ATS OR employer redirect). Simplify uses its own API with more direct links.
+ADZUNA_VOLUME_MODE = True
 
 ALLOWED_ATS = [
     "greenhouse.io",

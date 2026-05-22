@@ -61,10 +61,10 @@
 </head>
 <body>
   <h1>Adzuna — USA Scraper</h1>
-  <p class="sub">Standalone · port <strong>8002</strong> · Adzuna API · Last 24h only · Exp 0–5 yrs · USA · Apply = ATS / company career page only · {{ keywords_count }} keywords</p>
+  <p class="sub">Standalone · port <strong>8000</strong> · Adzuna API · Last 24h · USA · {{ keywords_count }} keywords · (run only when Simplify/Jobright are stopped)</p>
   {% if not has_adzuna_keys %}<p class="note" style="color:#fbbf24">Set <code>ADZUNA_APP_ID</code> and <code>ADZUNA_APP_KEY</code> (see .env.example) before Start.</p>{% endif %}
-  <p class="note"><strong>Start</strong> = delete all jobs + keyword 1. <strong>Resume</strong> = continue — keeps existing jobs, no overwrite/duplicates. <strong>Export CSV</strong> = all jobs with every column. USA only · ATS apply only.</p>
-  <p class="note">Run: <code>python manage.py runserver 8002 --noreload</code> → <strong>http://127.0.0.1:8002/</strong></p>
+  <p class="note"><strong>Volume mode ON:</strong> 81 keywords × 50 pages × 50 ads — max jobs (career or ATS apply). Skipped = Indeed/LinkedIn only or dead link. Simplify gets more because it uses simplify.jobs API directly.</p>
+  <p class="note">Run: <code>python manage.py runserver 8000 --noreload</code> → <strong>http://127.0.0.1:8000/</strong></p>
 
   <div class="toolbar">
     <button class="btn-start" id="btn-start">Start Scraper</button>

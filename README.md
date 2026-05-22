@@ -1,6 +1,6 @@
 # Adzuna USA Job Scraper
 
-Standalone Django app that scrapes US jobs from the [Adzuna API](https://developer.adzuna.com/), saves only **live ATS / company career apply links**, and exposes a web dashboard on port **8002**.
+Standalone Django app that scrapes US jobs from the [Adzuna API](https://developer.adzuna.com/). Dashboard on port **8000** (use when Simplify/Jobright are not running).
 
 ## Features
 
@@ -27,10 +27,10 @@ pip install -r requirements.txt
 copy .env.example .env
 # Edit .env — set ADZUNA_APP_ID and ADZUNA_APP_KEY
 python manage.py migrate
-python manage.py runserver 8002 --noreload
+python manage.py runserver 8000 --noreload
 ```
 
-Open **http://127.0.0.1:8002/**
+Open **http://127.0.0.1:8000/**
 
 Or use `start_server.bat` (after `.env` is configured).
 
@@ -109,6 +109,6 @@ git push
 
 | Project | Port | Source |
 |---------|------|--------|
-| Simplify | 8000 | simplify.jobs |
+| Simplify | 8000 | simplify.jobs (stop before running Adzuna on 8000) |
 | Jobright | 8001 | jobright.ai |
-| **Adzuna (this)** | **8002** | Adzuna API |
+| **Adzuna (this)** | **8000** | Adzuna API — same port as Simplify, only one at a time |
