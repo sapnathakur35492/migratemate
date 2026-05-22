@@ -1,8 +1,19 @@
-"""Django settings for standalone MigrateMate scraper project."""
+"""Django settings for standalone Adzuna scraper project."""
 import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+_env_file = BASE_DIR / ".env"
+if _env_file.exists():
+    for line in _env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and val and key not in os.environ:
+            os.environ[key] = val
 
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
@@ -77,13 +88,15 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 RUNSERVER_PORT = 8002
 
-# Maximize unique listings from Algolia (pagination + query variants + browse pass).
-MIGRATEMATE_HITS_PER_PAGE = 100
-MIGRATEMATE_MAX_PAGES_PER_KEYWORD = 20
-MIGRATEMATE_USE_QUERY_VARIANTS = True
-MIGRATEMATE_MAX_QUERIES_PER_KEYWORD = 3
-MIGRATEMATE_BROWSE_EMPTY_QUERY = True
-MIGRATEMATE_MAX_AGE_HOURS = 48
+# Adzuna API (register at https://developer.adzuna.com/signup)
+ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+ADZUNA_COUNTRY = "us"
+ADZUNA_RESULTS_PER_PAGE = 50
+ADZUNA_MAX_PAGES_PER_KEYWORD = 50
+ADZUNA_MAX_DAYS_OLD = 1
+ADZUNA_DEFAULT_WHERE = "United States"
+ADZUNA_API_BASE = "https://api.adzuna.com/v1/api"
 
 ALLOWED_ATS = [
     "greenhouse.io",
@@ -102,8 +115,14 @@ ALLOWED_ATS = [
     "amazon.jobs",
     "careers.microsoft.com",
     "jobs.apple.com",
+    "workable.com",
+    "recruitee.com",
+    "rippling.com",
+    "ultipro.com",
+    "paylocity.com",
 ]
 
+# Same 81 keywords as simplify/jobscraper/settings.py
 KEYWORDS = [
     "Software engineer",
     "Software developer",
@@ -186,68 +205,6 @@ KEYWORDS = [
     "Construction engineer",
     "Power Platform developer",
     "UI UX designer",
-    # Extra titles — more Algolia queries = more unique hits (paginated API)
-    "Python developer",
-    "Python engineer",
-    "React developer",
-    "React engineer",
-    "Node developer",
-    "Node.js developer",
-    "Golang developer",
-    "Go developer",
-    "Rust developer",
-    "C++ developer",
-    "C# developer",
-    "Ruby developer",
-    "PHP developer",
-    "Scala developer",
-    "Kotlin developer",
-    "Swift developer",
-    "Flutter developer",
-    "Angular developer",
-    "Vue developer",
-    "Typescript developer",
-    "Javascript developer",
-    "Web developer",
-    "Mobile developer",
-    "DevSecOps engineer",
-    "MLOps engineer",
-    "LLM engineer",
-    "NLP engineer",
-    "Computer vision engineer",
-    "Solutions architect",
-    "Cloud architect",
-    "Infrastructure engineer",
-    "Database administrator",
-    "PostgreSQL developer",
-    "MongoDB developer",
-    "Big data engineer",
-    "ETL engineer",
-    "BI developer",
-    "Tableau developer",
-    "Power BI developer",
-    "Salesforce engineer",
-    "ServiceNow developer",
-    "Workday consultant",
-    "SAP consultant",
-    "Oracle developer",
-    "Mainframe developer",
-    "Firmware engineer",
-    "Hardware engineer",
-    "Electrical engineer",
-    "Manufacturing engineer",
-    "Process engineer",
-    "Chemical engineer",
-    "Biomedical engineer",
-    "Research engineer",
-    "Staff engineer",
-    "Principal engineer",
-    "Lead developer",
-    "Senior developer",
-    "Junior developer",
-    "Entry level software engineer",
-    "New grad software engineer",
-    "Intern software engineer",
 ]
 
 LOGS_DIR = BASE_DIR / "logs"

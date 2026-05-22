@@ -3,12 +3,12 @@ import os
 from django.core.management.base import BaseCommand
 
 from migratemate.models import MigratemateScraperState
-from migratemate.scraper import MigratemateScraper
+from migratemate.scraper import AdzunaScraper
 from migratemate_site.scraper_process import clear_stop_flag
 
 
 class Command(BaseCommand):
-    help = "Run MigrateMate scraper in this process (used by dashboard Start button)."
+    help = "Run Adzuna scraper in this process (used by dashboard Start button)."
 
     def add_arguments(self, parser):
         parser.add_argument("--resume", action="store_true", help="Resume from saved keyword index")
@@ -21,10 +21,10 @@ class Command(BaseCommand):
         state.status = MigratemateScraperState.STATUS_RUNNING
         state.save(update_fields=["worker_pid", "status"])
 
-        self.stdout.write(self.style.SUCCESS(f"MigrateMate worker started PID={os.getpid()}"))
+        self.stdout.write(self.style.SUCCESS(f"Adzuna worker started PID={os.getpid()}"))
 
         try:
-            MigratemateScraper(resume=options["resume"]).run()
+            AdzunaScraper(resume=options["resume"]).run()
         finally:
             state = MigratemateScraperState.get_singleton()
             if state.worker_pid == os.getpid():
@@ -32,4 +32,4 @@ class Command(BaseCommand):
                 if state.status == MigratemateScraperState.STATUS_RUNNING:
                     state.status = MigratemateScraperState.STATUS_IDLE
                 state.save(update_fields=["worker_pid", "status"])
-            self.stdout.write("MigrateMate worker exited.")
+            self.stdout.write("Adzuna worker exited.")

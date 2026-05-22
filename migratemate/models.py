@@ -6,7 +6,7 @@ class MigratemateJob(models.Model):
     company = models.CharField(max_length=300)
     location = models.CharField(max_length=300)
     apply_url = models.URLField(unique=True, max_length=2000)
-    source = models.CharField(max_length=100, default="MigrateMate")
+    source = models.CharField(max_length=100, default="Adzuna")
     keyword = models.CharField(max_length=200)
     posted_time = models.CharField(max_length=100)
     posted_at = models.PositiveIntegerField(default=0, db_index=True)

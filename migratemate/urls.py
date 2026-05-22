@@ -10,4 +10,5 @@ urlpatterns = [
     path("api/scraper/stop/", views.scraper_stop, name="scraper_stop"),
     path("api/scraper/resume/", views.scraper_resume, name="scraper_resume"),
     path("api/jobs/clear/", views.jobs_clear_all, name="jobs_clear_all"),
+    path("api/jobs/export.csv", views.jobs_export_csv, name="jobs_export_csv"),
 ]

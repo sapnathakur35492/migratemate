@@ -11,8 +11,7 @@ SECONDS_24H = 86400
 
 
 def max_age_seconds():
-    hours = int(getattr(settings, "MIGRATEMATE_MAX_AGE_HOURS", 24))
-    return max(3600, hours * 3600)
+    return 86400
 
 
 def slugify_keyword(keyword):

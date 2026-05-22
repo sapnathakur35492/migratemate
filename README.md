@@ -1,67 +1,115 @@
-# MigrateMate USA Job Scraper
+# Adzuna USA Job Scraper
 
-Standalone Django app — **port 8002**, own `db.sqlite3`, no shared code with Simplify or Jobright.
+Standalone Django app that scrapes US jobs from the [Adzuna API](https://developer.adzuna.com/), saves only **live ATS / company career apply links**, and exposes a web dashboard on port **8002**.
 
-| | Simplify | Jobright | MigrateMate |
-|---|----------|----------|-------------|
-| Folder | `../simplify/` | `../Jobright_new/` | `MigrateMate_new/` |
-| Port | **8000** | **8001** | **8002** |
+## Features
 
-See `../PROJECTS.md` for running all three.
+- **81 keywords** — same list as the Simplify project (`simplify/jobscraper/settings.py`)
+- **USA only** — Adzuna `us` country + location filters (non-US countries rejected)
+- **Last 24 hours** — `max_days_old=1` + posted timestamp check
+- **Experience 0–5 years** — title/description filter + API `what_exclude` for senior roles
+- **ATS apply URLs only** — Greenhouse, Lever, Workday, Ashby, etc. (no LinkedIn, Indeed, or Adzuna portal links)
+- **Start / Stop / Resume** — Resume keeps existing jobs; no overwrite or duplicates (`apply_url` unique, Adzuna job ID tracked)
+- **Export CSV** — all jobs with columns: `title`, `company`, `location`, `posted_time`, `keyword`, `source`, `apply_url`, `posted_at`, `adzuna_job_id`, `scraped_at`
 
-## What it does
+## Requirements
 
-- Scrapes [migratemate.co/open-jobs](https://migratemate.co/open-jobs) via Playwright + Algolia API (`/api/jobs/search`).
-- **~142 keywords** + **browse pass** + up to **3 query variants** per keyword.
-- Up to **100 hits × 20 pages** per query (Algolia pagination).
-- Filters: **USA**, **last 48 hours** (`MIGRATEMATE_MAX_AGE_HOURS`), non-intern roles.
-- Apply URL: job description → **Greenhouse/Lever APIs** → career scan → detail panel — **company ATS only** (never `migratemate.co` portal links).
-- Title + company verified before save (avoids wrong board matches).
-- Typical yield: **lower saved count** than Simplify (strict ATS rule; many listings skipped).
+- Python 3.10+
+- Adzuna API credentials ([signup](https://developer.adzuna.com/signup))
 
-## Setup
+## Quick start
 
 ```powershell
 cd MigrateMate_new
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium
+copy .env.example .env
+# Edit .env — set ADZUNA_APP_ID and ADZUNA_APP_KEY
 python manage.py migrate
 python manage.py runserver 8002 --noreload
 ```
 
-Or double-click `start_server.bat`.
+Open **http://127.0.0.1:8002/**
 
-Dashboard: **http://127.0.0.1:8002/**
+Or use `start_server.bat` (after `.env` is configured).
 
-## Dashboard
+## Environment variables
 
-| Button | Action |
-|--------|--------|
-| **Start** | Clear all jobs, reset state, scrape from pass 1 |
-| **Resume** | Continue from last keyword (no duplicates) |
-| **Stop** | Save progress and stop background worker |
-| **Clear All Jobs** | Delete jobs only (scraper must be stopped) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ADZUNA_APP_ID` | Yes | Adzuna application ID |
+| `ADZUNA_APP_KEY` | Yes | Adzuna API key |
+| `DJANGO_SECRET_KEY` | No | Production secret (optional in dev) |
 
-Use **`--noreload`** while scraping so Django reload does not kill the browser worker.
+Never commit `.env` — use `.env.example` as a template.
 
-## Management commands
+## Dashboard actions
+
+| Action | Behavior |
+|--------|----------|
+| **Start** | Clears all jobs, runs all 81 keywords from the beginning |
+| **Stop** | Stops worker; jobs stay in the database |
+| **Resume** | Continues from last keyword/page; existing jobs kept, duplicates skipped |
+| **Export CSV** | Downloads every saved job (all columns) |
+| **Clear All Jobs** | Deletes all jobs (scraper must be stopped) |
+
+## CLI commands
 
 ```powershell
-python manage.py run_scraper
-python manage.py run_scraper --resume
-python manage.py purge_invalid_apply_urls   # migratemate portal + invalid ATS URLs
+python manage.py run_scraper              # Run scraper in foreground
+python manage.py run_scraper --resume     # Resume from saved state
+python manage.py purge_invalid_apply_urls # Remove dead / invalid apply URLs
 ```
 
-## Configuration (`migratemate_site/settings.py`)
+Optional QA (dev):
 
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `MIGRATEMATE_HITS_PER_PAGE` | 100 | Algolia page size |
-| `MIGRATEMATE_MAX_PAGES_PER_KEYWORD` | 20 | Max pages per query |
-| `MIGRATEMATE_USE_QUERY_VARIANTS` | True | engineer/developer variants |
-| `MIGRATEMATE_BROWSE_EMPTY_QUERY` | True | Full-site browse pass first |
-| `MIGRATEMATE_MAX_AGE_HOURS` | 48 | Job age window |
+```powershell
+python manage.py test_scraper_final
+python manage.py test_resume_csv
+```
 
-## Logs
+## Configuration
 
-- `logs/scraper.log`, `logs/worker.log` — not committed (see `.gitignore`)
+Edit `migratemate_site/settings.py`:
+
+| Setting | Default | Notes |
+|---------|---------|--------|
+| `KEYWORDS` | 81 titles | Synced with Simplify |
+| `ADZUNA_RESULTS_PER_PAGE` | 50 | API maximum |
+| `ADZUNA_MAX_PAGES_PER_KEYWORD` | 50 | Pages per keyword |
+| `ADZUNA_MAX_DAYS_OLD` | 1 | Last 24 hours |
+| `ALLOWED_ATS` | Greenhouse, Lever, … | Allowed apply hosts |
+
+## Project layout
+
+```
+MigrateMate_new/
+├── manage.py
+├── requirements.txt
+├── .env.example
+├── migratemate/              # App: models, scraper, views, dashboard
+├── migratemate_site/         # Django settings, apply URL rules
+└── logs/                     # Runtime logs (gitignored)
+```
+
+## Git push checklist
+
+- [ ] `.env` is **not** staged (listed in `.gitignore`)
+- [ ] `db.sqlite3` and `logs/` are **not** staged
+- [ ] `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` only in local `.env`
+
+```powershell
+git add README.md requirements.txt .env.example
+git add migratemate migratemate_site manage.py start_server.bat .gitignore
+git commit -m "Adzuna USA scraper: dashboard, CSV export, resume without duplicates"
+git push
+```
+
+## Related projects (same machine, different ports)
+
+| Project | Port | Source |
+|---------|------|--------|
+| Simplify | 8000 | simplify.jobs |
+| Jobright | 8001 | jobright.ai |
+| **Adzuna (this)** | **8002** | Adzuna API |

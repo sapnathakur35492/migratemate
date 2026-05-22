@@ -24,6 +24,10 @@ BLOCKED_HOST_PARTS = (
 
 BLOCKED_SITE_PARTS = (
     "migratemate.co",
+    "adzuna.com",
+    "adzuna.co.uk",
+    "zunastatic",
+    "kxcdn.com",
     "jobright.ai",
     "jobright.com",
     "simplify.jobs",
@@ -185,10 +189,15 @@ GENERIC_CAREER_SLUGS = frozenset(
 )
 
 
+_IMAGE_EXT = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|bmp|tiff?)(\?|#|$)", re.I)
+
+
 def is_specific_job_apply_url(url):
     if not url:
         return False
     low = url.lower()
+    if _IMAGE_EXT.search(low):
+        return False
     if "migratemate.co" in low:
         return False
     if "error=true" in low or "error=404" in low:

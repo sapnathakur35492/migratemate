@@ -1,6 +1,9 @@
+import csv
+from datetime import datetime
+
 from django.conf import settings
 from django.core.paginator import Paginator
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_http_methods
 
@@ -8,12 +11,18 @@ from .models import MigratemateJob, MigratemateScraperState
 from .scraper import JOBS_PER_PAGE, is_scraper_running, start_scraper, stop_scraper
 from .time_utils import format_posted_time
 
-
-def search_passes_total():
-    total = len(settings.KEYWORDS)
-    if getattr(settings, "MIGRATEMATE_BROWSE_EMPTY_QUERY", False):
-        total += 1
-    return total
+CSV_COLUMNS = (
+    "title",
+    "company",
+    "location",
+    "posted_time",
+    "keyword",
+    "source",
+    "apply_url",
+    "posted_at",
+    "adzuna_job_id",
+    "scraped_at",
+)
 
 
 def dashboard(request):
@@ -24,8 +33,10 @@ def dashboard(request):
         {
             "state": state,
             "job_count": MigratemateJob.objects.count(),
-            "keywords_count": search_passes_total(),
-            "max_age_hours": getattr(settings, "MIGRATEMATE_MAX_AGE_HOURS", 24),
+            "keywords_count": len(settings.KEYWORDS),
+            "has_adzuna_keys": bool(
+                getattr(settings, "ADZUNA_APP_ID", "") and getattr(settings, "ADZUNA_APP_KEY", "")
+            ),
         },
     )
 
@@ -72,7 +83,7 @@ def status_api(request):
         status = MigratemateScraperState.STATUS_RUNNING
     elif status == MigratemateScraperState.STATUS_RUNNING:
         status = MigratemateScraperState.STATUS_STOPPED
-    total_kw = search_passes_total()
+    total_kw = len(settings.KEYWORDS)
     kw_done = state.keyword_index
     if status == MigratemateScraperState.STATUS_IDLE and kw_done >= total_kw:
         kw_done = total_kw
@@ -113,6 +124,32 @@ def scraper_resume(request):
         return JsonResponse({"ok": False, "message": "Already running"})
     ok, msg = start_scraper(resume=True)
     return JsonResponse({"ok": ok, "message": msg})
+
+
+def jobs_export_csv(request):
+    """Export all jobs in DB to CSV (every column)."""
+    filename = f"adzuna_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    response = HttpResponse(content_type="text/csv; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.write("\ufeff")
+    writer = csv.writer(response)
+    writer.writerow(CSV_COLUMNS)
+    for job in MigratemateJob.objects.all().order_by("-created_at").iterator(chunk_size=500):
+        writer.writerow(
+            [
+                job.title,
+                job.company,
+                job.location,
+                job.posted_time,
+                job.keyword,
+                job.source,
+                job.apply_url,
+                job.posted_at,
+                job.migratemate_job_id,
+                job.created_at.strftime("%Y-%m-%d %H:%M:%S") if job.created_at else "",
+            ]
+        )
+    return response
 
 
 @require_http_methods(["POST"])

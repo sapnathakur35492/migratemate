@@ -1,18 +1,19 @@
-import json
+"""Adzuna USA job scraper (replaces MigrateMate). Port 8002."""
 import logging
 import os
 import random
 import re
 import threading
 import time
+from datetime import datetime
 from difflib import SequenceMatcher
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote
 
-from bs4 import BeautifulSoup
+import requests
 from django.conf import settings
 from django.db import IntegrityError, close_old_connections
-from playwright.sync_api import sync_playwright
 
+from migratemate_site.apply_live import is_apply_url_live
 from migratemate_site.apply_urls import is_blocked_apply_host, is_valid_apply_url as _valid_apply
 from migratemate_site.scraper_process import (
     clear_stop_flag,
@@ -24,56 +25,51 @@ from migratemate_site.scraper_process import (
 )
 
 from .models import MigratemateJob, MigratemateScraperState
-from .time_utils import format_posted_time, is_within_24h_timestamp, slugify_keyword
+from .time_utils import format_posted_time, is_within_24h_timestamp
 
 logger = logging.getLogger("migratemate_scraper")
 
 _stop_event = threading.Event()
-_active_browser = None
-_active_lock = threading.Lock()
-
-JOBS_PER_PAGE = 20
-HITS_PER_PAGE = int(getattr(settings, "MIGRATEMATE_HITS_PER_PAGE", 100))
-MAX_PAGES_PER_KEYWORD = int(getattr(settings, "MIGRATEMATE_MAX_PAGES_PER_KEYWORD", 20))
-USE_QUERY_VARIANTS = getattr(settings, "MIGRATEMATE_USE_QUERY_VARIANTS", True)
-MAX_QUERIES_PER_KEYWORD = int(getattr(settings, "MIGRATEMATE_MAX_QUERIES_PER_KEYWORD", 3))
-BROWSE_EMPTY_QUERY = getattr(settings, "MIGRATEMATE_BROWSE_EMPTY_QUERY", True)
-BROWSE_KEYWORD_LABEL = "Recent listings (browse)"
-BASE_URL = "https://migratemate.co"
-OPEN_JOBS = f"{BASE_URL}/open-jobs"
-SEARCH_API = f"{BASE_URL}/api/jobs/search"
+ATS_DOMAINS = tuple(settings.ALLOWED_ATS)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-ATS_DOMAINS = tuple(settings.ALLOWED_ATS)
-CAREER_PATH_SUFFIXES = ("", "/careers", "/jobs", "/career", "/join-us", "/work-with-us", "/open-positions")
+JOBS_PER_PAGE = 20
+RESULTS_PER_PAGE = int(getattr(settings, "ADZUNA_RESULTS_PER_PAGE", 50))
+MAX_PAGES = int(getattr(settings, "ADZUNA_MAX_PAGES_PER_KEYWORD", 40))
+MAX_DAYS_OLD = int(getattr(settings, "ADZUNA_MAX_DAYS_OLD", 1))
+DEFAULT_WHERE = getattr(settings, "ADZUNA_DEFAULT_WHERE", "United States")
 
-SEARCH_FETCH_JS = """async (body) => {
-    const r = await fetch('/api/jobs/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        credentials: 'include',
-    });
-    if (!r.ok) {
-        return { ok: false, status: r.status, error: (await r.text()).slice(0, 500) };
-    }
-    return { ok: true, data: await r.json() };
-}"""
+EXPERIENCE_HARD_BLOCK = (
+    "director",
+    "vice president",
+    " vp,",
+    " vp ",
+    "chief ",
+    "head of",
+    "principal engineer",
+    "staff engineer",
+    "distinguished engineer",
+    "10+ years",
+    "15+ years",
+    "20+ years",
+    "12+ years",
+    "8+ years",
+    "7+ years",
+    "6+ years",
+    "executive director",
+)
 
-
-def _close_active_browser():
-    global _active_browser
-    with _active_lock:
-        browser = _active_browser
-        _active_browser = None
-    if browser:
-        try:
-            browser.close()
-        except Exception:
-            pass
+ATS_URL_IN_TEXT = re.compile(
+    r"https?://[^\s\"'<>\\]+?(?:"
+    r"greenhouse\.io|lever\.co|myworkdayjobs\.com|myworkdaysite\.com|"
+    r"ashbyhq\.com|smartrecruiters\.com|icims\.com|jobvite\.com|"
+    r"oraclecloud\.com|workable\.com|recruitee\.com|bamboohr\.com"
+    r")[^\s\"'<>\\]*",
+    re.I,
+)
 
 
 def _should_stop():
@@ -85,240 +81,128 @@ def is_scraper_running():
     return pid_is_alive(state.worker_pid)
 
 
-def is_usa_location(location):
-    loc = (location or "").lower()
-    if not loc:
-        return False
-    if any(
-        x in loc
-        for x in (
-            "usa",
-            "united states",
-            "u.s.",
-            ", us",
-            "remote in usa",
-            "remote, us",
-        )
-    ):
-        return True
-    if ", " in loc:
-        return True
-    us_states = (
-        "alabama",
-        "alaska",
-        "arizona",
-        "arkansas",
-        "california",
-        "colorado",
-        "connecticut",
-        "delaware",
-        "florida",
-        "georgia",
-        "hawaii",
-        "idaho",
-        "illinois",
-        "indiana",
-        "iowa",
-        "kansas",
-        "kentucky",
-        "louisiana",
-        "maine",
-        "maryland",
-        "massachusetts",
-        "michigan",
-        "minnesota",
-        "mississippi",
-        "missouri",
-        "montana",
-        "nebraska",
-        "nevada",
-        "hampshire",
-        "jersey",
-        "mexico",
-        "york",
-        "carolina",
-        "dakota",
-        "ohio",
-        "oklahoma",
-        "oregon",
-        "pennsylvania",
-        "rhode island",
-        "south carolina",
-        "south dakota",
-        "tennessee",
-        "texas",
-        "utah",
-        "vermont",
-        "virginia",
-        "washington",
-        "west virginia",
-        "wisconsin",
-        "wyoming",
-        "district of columbia",
-    )
-    return any(s in loc for s in us_states)
-
-
 def is_valid_apply_url(url, company_url=""):
     return _valid_apply(url, ATS_DOMAINS, company_url=company_url)
 
 
-def _find_ats_in_text(text, company_url=""):
-    if not text:
-        return []
-    found = []
-    soup = BeautifulSoup(text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        u = a["href"].strip()
-        if u.startswith("//"):
-            u = "https:" + u
-        elif u.startswith("/"):
-            continue
-        if is_blocked_apply_host(u):
-            continue
-        if is_valid_apply_url(u, company_url=company_url):
-            found.append(u)
-    for m in re.finditer(r"https?://[^\s\"'<>\\]+", text):
-        u = m.group(0).rstrip(".,;)")
-        if is_blocked_apply_host(u):
-            continue
-        if is_valid_apply_url(u, company_url=company_url):
-            found.append(u)
-    return found
-
-
-def _is_direct_ats_job_url(url):
-    low = (url or "").lower()
-    if "greenhouse.io" in low and re.search(r"/jobs/\d+", low):
-        return True
-    if "lever.co" in low and re.search(r"lever\.co/[^/]+/[0-9a-f-]{8,}", low):
-        return True
-    if "ashbyhq.com" in low and re.search(r"[0-9a-f-]{20,}", low):
-        return True
-    return False
-
-
-def _queries_for_keyword(keyword):
-    if not keyword:
-        return [""]
-    queries = [keyword]
-    if USE_QUERY_VARIANTS:
-        low = keyword.lower()
-        if "engineer" in low and "developer" not in low:
-            queries.append(
-                keyword.replace("engineer", "developer").replace("Engineer", "Developer")
-            )
-        elif "developer" in low and "engineer" not in low:
-            queries.append(
-                keyword.replace("developer", "engineer").replace("Developer", "Engineer")
-            )
-        if "analyst" in low:
-            queries.append(keyword.replace("analyst", "analysis").replace("Analyst", "Analysis"))
-    out = []
-    seen = set()
-    for q in queries:
-        k = q.strip().lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(q)
-    return out[:MAX_QUERIES_PER_KEYWORD]
-
-
-def _is_job_page_ok(request_ctx, url, company_url="", job_title="", company_name=""):
-    if _is_direct_ats_job_url(url) and is_valid_apply_url(url, company_url=company_url):
-        if job_title and not _apply_page_matches_job(request_ctx, url, job_title, company_name):
-            return False, url
-        return True, url
-    if is_blocked_apply_host(url) or not is_valid_apply_url(url, company_url=company_url):
-        return False, url
-    try:
-        resp = request_ctx.get(url, max_redirects=12, timeout=25000)
-        final = resp.url
-        if resp.status >= 400:
-            return False, final
-        if is_blocked_apply_host(final):
-            return False, final
-        if not is_valid_apply_url(final, company_url=company_url):
-            return False, final
-        if job_title and not _apply_page_matches_job(request_ctx, final, job_title, company_name):
-            return False, final
-        if company_url:
-            fu = urlparse(final)
-            if _host_on_company(fu.netloc, company_url) and fu.path in ("", "/"):
-                return False, final
-        body = (resp.text() or "").lower()[:8000]
-        if any(x in body for x in ("page not found", "404 error", "job no longer", "position filled", "expired")):
-            return False, final
-        return True, final
-    except Exception as exc:
-        logger.warning("URL verify failed %s: %s", url[:80], exc)
-        return False, url
-
-
-def _host_on_company(host, company_url):
-    from migratemate_site.apply_urls import _host_on_company_domain
-
-    return _host_on_company_domain(host.lower(), company_url)
-
-
-def _company_slug(hit):
-    logo = hit.get("company_logo_url") or ""
-    m = re.search(r"/company-logos/([^./]+)", logo)
-    if m:
-        return m.group(1)
-    return slugify_keyword(hit.get("company") or "")
-
-
-GENERIC_BOARD_TOKENS = frozenset(
+NON_US_AREA_NAMES = frozenset(
     {
-        "community",
-        "health",
-        "group",
-        "services",
-        "global",
-        "national",
-        "solutions",
-        "partners",
-        "consulting",
-        "management",
-        "systems",
-        "care",
-        "center",
-        "centre",
-        "parkland",
-        "united",
-        "american",
-        "general",
-        "digital",
-        "technology",
-        "tech",
-        "international",
-        "holdings",
-        "industries",
-        "corporation",
-        "company",
-        "inc",
-        "llc",
-        "ltd",
+        "canada",
+        "mexico",
+        "united kingdom",
+        "uk",
+        "india",
+        "australia",
+        "germany",
+        "france",
+        "ireland",
+        "singapore",
+        "philippines",
+        "brazil",
+        "china",
+        "japan",
+        "spain",
+        "italy",
+        "netherlands",
+        "poland",
+        "puerto rico",
     }
 )
 
+NON_US_LOCATION_HINTS = (
+    "canada",
+    "toronto",
+    "vancouver",
+    "montreal",
+    "mexico",
+    "united kingdom",
+    " london",
+    "manchester",
+    "india",
+    "bangalore",
+    "hyderabad",
+    "australia",
+    "sydney",
+    "melbourne",
+    "germany",
+    "berlin",
+    "ireland",
+    "dublin",
+    "singapore",
+    "remote - uk",
+    "remote - canada",
+    "remote - india",
+)
 
-def _board_tokens(company, slug):
-    """Prefer MigrateMate logo slug + full company slug — avoid generic single-word tokens."""
-    tokens = []
-    if slug and len(slug) >= 4 and slug not in GENERIC_BOARD_TOKENS:
-        tokens.append(slug)
-        compact = slug.replace("-", "")
-        if len(compact) >= 5 and compact not in GENERIC_BOARD_TOKENS:
-            tokens.append(compact)
-    full = slugify_keyword(company or "")
-    if full and len(full) >= 5 and full not in GENERIC_BOARD_TOKENS:
-        tokens.append(full)
-        compact_full = full.replace("-", "")
-        if len(compact_full) >= 6:
-            tokens.append(compact_full)
-    return list(dict.fromkeys(t for t in tokens if t))
+
+def _display_has_non_us_country(display):
+    low = (display or "").lower()
+    if not low:
+        return False
+    if any(h in low for h in NON_US_LOCATION_HINTS):
+        if not any(x in low for x in ("usa", "united states", ", us", " u.s.", "u.s.a")):
+            return True
+    return False
+
+
+def is_usa_job(location_obj):
+    """Adzuna US API + area hierarchy; reject explicit non-US countries."""
+    if not location_obj:
+        return False
+    area = location_obj.get("area") or []
+    if area:
+        top = str(area[0]).lower()
+        if top in NON_US_AREA_NAMES:
+            return False
+        if any(str(a).upper() in ("US", "USA", "UNITED STATES") for a in area):
+            return True
+    display = location_obj.get("display_name") or ""
+    if _display_has_non_us_country(display):
+        return False
+    # City/county only (e.g. "North Reading, Middlesex County") — OK on US Adzuna feed
+    return bool(display.strip())
+
+
+def is_usa_location_string(location):
+    """Saved row audit: reject only if location text names a non-US country."""
+    return not _display_has_non_us_country(location)
+
+
+def is_experience_0_to_5(title, description=""):
+    blob = f"{title} {description}".lower()
+    if any(h in blob for h in EXPERIENCE_HARD_BLOCK):
+        return False
+    if re.search(r"\b([6-9]|1[0-9]|20)\+?\s*(?:years?|yrs?)\b", blob):
+        return False
+    if re.search(r"\b(?:minimum|min\.?|at least)\s*([6-9]|1[0-9])\s*(?:years?|yrs?)\b", blob):
+        return False
+    if re.search(r"\b(senior|sr\.)\b", blob):
+        if not re.search(r"\b(junior|entry|new grad|associate|intern)\b", blob):
+            return False
+    if re.search(r"\bengineering manager\b", blob) or re.search(r"\btech lead\b", blob):
+        return False
+    if re.search(r"\b(manager|director)\b", blob) and not re.search(
+        r"\b(product manager|project manager|program manager|account manager|"
+        r"marketing manager|finance manager|supply chain manager)\b",
+        blob,
+    ):
+        return False
+    return True
+
+
+def job_exists(title, company, location, apply_url, adzuna_job_id=""):
+    close_old_connections()
+    if adzuna_job_id and MigratemateJob.objects.filter(migratemate_job_id=adzuna_job_id).exists():
+        return True
+    if MigratemateJob.objects.filter(apply_url=apply_url).exists():
+        return True
+    return MigratemateJob.objects.filter(title=title, company=company, location=location).exists()
+
+
+def _api_credentials():
+    app_id = getattr(settings, "ADZUNA_APP_ID", "") or os.environ.get("ADZUNA_APP_ID", "")
+    app_key = getattr(settings, "ADZUNA_APP_KEY", "") or os.environ.get("ADZUNA_APP_KEY", "")
+    return app_id, app_key
 
 
 def _title_match_score(want, found):
@@ -327,162 +211,147 @@ def _title_match_score(want, found):
     return SequenceMatcher(None, want.lower(), found.lower()).ratio()
 
 
-def _company_name_overlap(company, other):
-    if not company or not other:
-        return False
-    cw = set(re.findall(r"[a-z]{4,}", company.lower()))
-    ow = set(re.findall(r"[a-z]{4,}", other.lower()))
-    if not cw or not ow:
-        return False
-    return len(cw & ow) >= 2
+def _board_tokens(company):
+    company = (company or "").strip()
+    tokens = []
+    slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
+    if slug and len(slug) >= 4:
+        tokens.extend([slug, slug.replace("-", "")])
+    clean = re.sub(r"[^a-z0-9]", "", company.lower())
+    if clean and len(clean) >= 4:
+        tokens.append(clean)
+    return list(dict.fromkeys(t for t in tokens if t))
 
 
-def _gh_board_matches_company(request_ctx, token, company):
-    try:
-        resp = request_ctx.get(
-            f"https://boards-api.greenhouse.io/v1/boards/{token}",
-            timeout=12000,
-        )
-        if resp.status >= 400:
-            return False
-        name = (resp.json().get("name") or "").strip()
-        if not name:
-            return False
-        if _title_match_score(company, name) >= 0.42:
-            return True
-        return _company_name_overlap(company, name)
-    except Exception:
-        return False
-
-
-def _lever_site_matches_company(request_ctx, token, company):
-    try:
-        resp = request_ctx.get(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout=12000)
-        if resp.status >= 400:
-            return False
-        postings = resp.json()
-        if not isinstance(postings, list) or not postings:
-            return False
-        site = (postings[0].get("categories", {}) or {}).get("team") or ""
-        host = token.replace("-", " ")
-        return _company_name_overlap(company, site) or _company_name_overlap(company, host)
-    except Exception:
-        return False
-
-
-def _apply_page_matches_job(request_ctx, url, job_title, company=""):
-    if not job_title:
-        return True
-    try:
-        resp = request_ctx.get(url, timeout=20000)
-        if resp.status >= 400:
-            return False
-        text = (resp.text() or "")[:20000].lower()
-        title_low = job_title.lower()
-        if _title_match_score(job_title, text) >= 0.38:
-            return True
-        keywords = [w for w in re.findall(r"[a-z]{4,}", title_low) if w not in ("senior", "lead", "staff", "manager")]
-        if not keywords:
-            return True
-        hits = sum(1 for w in keywords[:6] if w in text)
-        need = max(2, min(4, len(keywords) // 2 + 1))
-        if hits >= need:
-            return True
-        if company and _company_name_overlap(company, text):
-            return hits >= max(1, len(keywords) // 3)
-        return False
-    except Exception:
-        return False
-
-
-def _greenhouse_apply(request_ctx, tokens, job_title, company="", min_score=0.68):
+def _greenhouse_apply(session, job_title, company, gh_cache, min_score=0.62):
     best_url = None
     best_score = 0.0
-    for token in tokens[:6]:
+    for token in _board_tokens(company)[:5]:
         if _should_stop():
             break
-        if not _gh_board_matches_company(request_ctx, token, company):
-            continue
-        api = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs"
-        try:
-            resp = request_ctx.get(api, timeout=15000)
-            if resp.status >= 400:
-                continue
-            jobs = resp.json().get("jobs") or []
-        except Exception:
+        if token in gh_cache:
+            jobs = gh_cache[token]
+        else:
+            jobs = None
+            try:
+                r = session.get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout=10)
+                if r.status_code < 400:
+                    jobs = r.json().get("jobs") or []
+            except Exception:
+                pass
+            gh_cache[token] = jobs
+        if not jobs:
             continue
         for job in jobs:
-            gh_title = job.get("title") or ""
-            score = _title_match_score(job_title, gh_title)
+            score = _title_match_score(job_title, job.get("title") or "")
             if score > best_score:
                 best_score = score
                 best_url = job.get("absolute_url") or ""
     if best_url and best_score >= min_score and is_valid_apply_url(best_url):
-        if _apply_page_matches_job(request_ctx, best_url, job_title, company):
-            return best_url
+        return best_url
     return None
 
 
-def _lever_apply(request_ctx, tokens, job_title, company="", min_score=0.65):
+def _lever_apply(session, job_title, company, lever_cache, min_score=0.58):
     best_url = None
     best_score = 0.0
-    for token in tokens[:6]:
+    for token in _board_tokens(company)[:5]:
         if _should_stop():
             break
-        if not _lever_site_matches_company(request_ctx, token, company):
+        if token in lever_cache:
+            posts = lever_cache[token]
+        else:
+            posts = None
+            try:
+                r = session.get(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout=10)
+                if r.status_code < 400:
+                    data = r.json()
+                    posts = data if isinstance(data, list) else []
+            except Exception:
+                pass
+            lever_cache[token] = posts
+        if not posts:
             continue
-        api = f"https://api.lever.co/v0/postings/{token}?mode=json"
-        try:
-            resp = request_ctx.get(api, timeout=15000)
-            if resp.status >= 400:
-                continue
-            postings = resp.json()
-            if not isinstance(postings, list):
-                continue
-        except Exception:
-            continue
-        for post in postings:
-            lev_title = post.get("text") or post.get("title") or ""
-            score = _title_match_score(job_title, lev_title)
+        for post in posts:
+            score = _title_match_score(job_title, post.get("text") or post.get("title") or "")
             if score > best_score:
                 best_score = score
                 best_url = post.get("hostedUrl") or post.get("applyUrl") or ""
     if best_url and best_score >= min_score and is_valid_apply_url(best_url):
-        if _apply_page_matches_job(request_ctx, best_url, job_title, company):
-            return best_url
+        return best_url
     return None
 
 
-def _company_url_guesses(company, slug):
-    urls = []
-    clean = re.sub(r"[^a-z0-9]", "", (company or "").lower())
-    slug_compact = (slug or "").replace("-", "")
-    if slug_compact:
-        urls.extend(
-            [
-                f"https://www.{slug_compact}.com",
-                f"https://{slug}.com" if slug else "",
-            ]
-        )
-    if clean and clean != slug_compact:
-        urls.append(f"https://www.{clean}.com")
-    return [u for u in urls if u and u.startswith("http")]
+def _collect_redirect_candidates(session, redirect_url):
+    candidates = []
+    try:
+        resp = session.get(redirect_url, allow_redirects=True, timeout=15)
+        final = (resp.url or "").strip()
+        if final and not is_blocked_apply_host(final) and is_valid_apply_url(final):
+            candidates.append(final)
+        text = (resp.text or "")[:120000]
+        for m in ATS_URL_IN_TEXT.finditer(text):
+            u = m.group(0).rstrip(".,;)'\"")
+            if not is_blocked_apply_host(u) and is_valid_apply_url(u):
+                candidates.append(u)
+        for m in re.finditer(r"https?://[^\s\"'<>\\]+", text):
+            u = m.group(0).rstrip(".,;)'\"")
+            if not is_blocked_apply_host(u) and is_valid_apply_url(u):
+                candidates.append(u)
+    except Exception as exc:
+        logger.debug("Redirect follow failed: %s", exc)
+    return candidates
 
 
-def job_exists(title, company, location, apply_url):
-    close_old_connections()
-    if MigratemateJob.objects.filter(apply_url=apply_url).exists():
-        return True
-    return MigratemateJob.objects.filter(title=title, company=company, location=location).exists()
+def _pick_live_apply(session, candidates):
+    seen = set()
+    for url in candidates:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if "adzuna." in url.lower():
+            continue
+        if is_apply_url_live(session, url, ATS_DOMAINS):
+            return url
+    return None
 
 
-class MigratemateScraper:
+def _resolve_apply_url(session, redirect_url, job_title, company, gh_cache, lever_cache):
+    if not redirect_url:
+        return None
+    candidates = _collect_redirect_candidates(session, redirect_url)
+    found = _pick_live_apply(session, candidates)
+    if found:
+        return found
+    gh = _greenhouse_apply(session, job_title, company, gh_cache)
+    if gh and is_apply_url_live(session, gh, ATS_DOMAINS):
+        return gh
+    lev = _lever_apply(session, job_title, company, lever_cache)
+    if lev and is_apply_url_live(session, lev, ATS_DOMAINS):
+        return lev
+    return None
+
+
+def _parse_created_ts(created_str):
+    if not created_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+class AdzunaScraper:
     def __init__(self, resume=False):
         self.resume = resume
         self.state = MigratemateScraperState.get_singleton()
         raw = self.state.processed_ids or ""
         self.processed = set(x for x in raw.split(",") if x)
-        self._session_ready = False
+        self.app_id, self.app_key = _api_credentials()
+        self.country = getattr(settings, "ADZUNA_COUNTRY", "us")
+        self._gh_cache = {}
+        self._lever_cache = {}
         if resume:
             self._hydrate_processed_from_db()
 
@@ -493,12 +362,15 @@ class MigratemateScraper:
             "migratemate_job_id", flat=True
         ).iterator(chunk_size=5000):
             if jid:
-                self.processed.add(jid)
+                self.processed.add(str(jid))
+        db_count = MigratemateJob.objects.count()
+        if self.resume and self.state.jobs_saved < db_count:
+            self.state.jobs_saved = db_count
         logger.info(
-            "Resume: %s IDs in state, +%s from DB (total %s)",
+            "Resume: %s IDs in state, +%s from DB, jobs_saved=%s",
             before,
             len(self.processed) - before,
-            len(self.processed),
+            self.state.jobs_saved,
         )
 
     def _save_state(self, **kwargs):
@@ -512,294 +384,157 @@ class MigratemateScraper:
         if _should_stop():
             raise StopIteration
 
-    def _human_delay(self, lo=0.25, hi=0.9):
+    def _human_delay(self, lo=0.08, hi=0.22):
         end = time.time() + random.uniform(lo, hi)
         while time.time() < end:
             if _should_stop():
                 raise StopIteration
-            time.sleep(0.12)
+            time.sleep(0.1)
 
-    def _ensure_session(self, page):
-        if self._session_ready:
-            return
-        page.goto(OPEN_JOBS, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(4000)
-        self._session_ready = True
-
-    def _search_keyword_page(self, page, query, page_num):
-        body = {
-            "context": "demo",
-            "indexName": "live-demo",
-            "requests": [
-                {
-                    "indexName": "live-demo",
-                    "params": {
-                        "query": query,
-                        "hitsPerPage": HITS_PER_PAGE,
-                        "page": page_num,
-                        "facetFilters": [["intern_y_n:NO"]],
-                    },
-                }
-            ],
-        }
-        for attempt in range(2):
-            out = page.evaluate(SEARCH_FETCH_JS, body)
-            if out.get("ok"):
-                data = out["data"]
-                if "results" in data and data["results"]:
-                    return data["results"][0]
-                return data
-            status = out.get("status")
-            if status == 403 and attempt == 0:
-                logger.info("Search 403 — refreshing session")
-                self._session_ready = False
-                self._ensure_session(page)
-                page.wait_for_timeout(2000)
-                continue
-            err = (out.get("error") or "")[:200]
-            logger.warning(
-                "Search failed query=%s page=%s status=%s %s",
-                query[:40] or "(browse)",
-                page_num,
-                status,
-                err,
-            )
-            return None
-        return None
-
-    def _fetch_hits_for_query(self, page, query):
-        merged = {}
-        page_num = 0
-        max_pages = MAX_PAGES_PER_KEYWORD
-        while page_num < max_pages:
-            self._check_stop()
-            res = self._search_keyword_page(page, query, page_num)
-            if not res:
-                break
-            hits = res.get("hits") or []
-            nb_pages = int(res.get("nbPages") or 1)
-            max_pages = min(max_pages, nb_pages)
-            if not hits:
-                break
-            for hit in hits:
-                oid = hit.get("objectID")
-                if oid:
-                    merged[oid] = hit
-            page_num += 1
-            if page_num >= nb_pages:
-                break
-            self._human_delay(0.2, 0.5)
-        return list(merged.values())
-
-    def _load_keyword_hits(self, page, keyword):
-        merged = {}
-        for query in _queries_for_keyword(keyword):
-            if _should_stop():
-                break
-            for hit in self._fetch_hits_for_query(page, query):
-                oid = hit.get("objectID")
-                if oid and oid not in merged:
-                    merged[oid] = hit
-            self._human_delay(0.15, 0.35)
-        return list(merged.values())
-
-    def _scan_company_careers(self, request_ctx, company_url, job_title):
-        urls = []
-        if not company_url or not company_url.startswith("http"):
-            return urls
-        base = company_url.rstrip("/")
-        title_words = [w.lower() for w in re.findall(r"[a-zA-Z]{4,}", job_title or "")][:4]
-
-        for suffix in CAREER_PATH_SUFFIXES:
-            if _should_stop():
-                break
-            try:
-                target = base + suffix
-                resp = request_ctx.get(target, timeout=20000)
-                if resp.status >= 400:
-                    continue
-                soup = BeautifulSoup(resp.text(), "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if href.startswith("//"):
-                        href = "https:" + href
-                    elif href.startswith("/"):
-                        href = urljoin(target, href)
-                    if is_blocked_apply_host(href) or not is_valid_apply_url(href, company_url=company_url):
-                        continue
-                    text = (a.get_text() or "").lower()
-                    if any(d in href.lower() for d in ATS_DOMAINS):
-                        urls.append(href)
-                    elif title_words and any(w in text for w in title_words):
-                        urls.append(href)
-            except Exception:
-                continue
-        return urls
-
-    def _extract_apply_url(self, page, context, hit):
-        self._check_stop()
-        job_id = hit.get("objectID")
-        title = hit.get("title") or ""
-        company = hit.get("company") or ""
-        slug = _company_slug(hit)
-        company_urls = _company_url_guesses(company, slug)
-        company_url = company_urls[0] if company_urls else ""
-
-        candidates = []
-        tokens = _board_tokens(company, slug)
-        desc = hit.get("formatted_description") or ""
-        candidates.extend(_find_ats_in_text(desc, company_url))
-
-        gh = _greenhouse_apply(context.request, tokens, title, company)
-        if gh:
-            candidates.append(gh)
-        lev = _lever_apply(context.request, tokens, title, company)
-        if lev:
-            candidates.append(lev)
-
-        if not candidates and company_urls:
-            for guess in company_urls[:2]:
-                candidates.extend(self._scan_company_careers(context.request, guess, title))
-                if candidates:
-                    break
-
-        if not candidates:
-            try:
-                page.goto(f"{OPEN_JOBS}?selectedJob={job_id}", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2000)
-                for label, selector in (
-                    ("Apply", 'button:has-text("Apply")'),
-                    ("Apply Now", 'a:has-text("Apply Now")'),
-                ):
-                    try:
-                        with context.expect_page(timeout=10000) as pinfo:
-                            page.locator(selector).first.click(timeout=5000)
-                        popup = pinfo.value
-                        popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                        if popup.url and "migratemate" not in popup.url.lower():
-                            candidates.insert(0, popup.url)
-                        candidates.extend(_find_ats_in_text(popup.content(), company_url))
-                        popup.close()
-                    except Exception:
-                        pass
-                candidates.extend(_find_ats_in_text(page.content(), company_url))
-                for sel in (
-                    'a[href*="greenhouse"]',
-                    'a[href*="lever.co"]',
-                    'a[href*="myworkday"]',
-                    'a[href*="amazon.jobs"]',
-                    'a[href*="ashbyhq.com"]',
-                ):
-                    loc = page.locator(sel)
-                    for i in range(min(3, loc.count())):
-                        href = loc.nth(i).get_attribute("href")
-                        if href and is_valid_apply_url(href, company_url=company_url):
-                            candidates.append(href)
-            except Exception as exc:
-                logger.debug("Panel scrape %s: %s", job_id, exc)
-
-        seen = set()
-        for url in candidates:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            if "migratemate.co" in url.lower():
-                continue
-            ok, final = _is_job_page_ok(
-                context.request, url, company_url, job_title=title, company_name=company
-            )
-            if ok:
-                logger.info("ATS OK %s -> %s", job_id, final[:90])
-                return final
-        return None
-
-    def _process_keyword(self, page, context, keyword, ki, total, display_keyword=None):
-        saved_before = self.state.jobs_saved
-        self._ensure_session(page)
-        label = display_keyword or keyword or BROWSE_KEYWORD_LABEL
-        hits = self._load_keyword_hits(page, keyword)
-        if not hits:
-            logger.info("No jobs for keyword: %s", label)
-            return 0
-
-        self._save_state(
-            current_page=1,
-            last_message=f"[{ki + 1}/{total}] {label} — {len(hits)} unique hits",
-            current_keyword=label,
+    def _search_page(self, session, keyword, page_num):
+        if not self.app_id or not self.app_key:
+            raise RuntimeError("Set ADZUNA_APP_ID and ADZUNA_APP_KEY in environment or settings")
+        url = (
+            f"{settings.ADZUNA_API_BASE}/jobs/{self.country}/search/{page_num}"
+            f"?app_id={quote(self.app_id)}&app_key={quote(self.app_key)}"
+            f"&what={quote(keyword)}&where={quote(DEFAULT_WHERE)}"
+            f"&results_per_page={RESULTS_PER_PAGE}&max_days_old={MAX_DAYS_OLD}"
+            f"&sort_by=date&content-type=application/json"
+            f"&what_exclude={quote('senior director principal vp chief')}"
         )
+        try:
+            resp = session.get(url, timeout=45)
+            if resp.status_code != 200:
+                logger.warning("Adzuna API %s page %s status=%s", keyword, page_num, resp.status_code)
+                return [], 0
+            data = resp.json()
+            results = data.get("results") or []
+            count = int(data.get("count") or 0)
+            return results, count
+        except Exception as exc:
+            logger.warning("Adzuna search error %s page %s: %s", keyword, page_num, exc)
+            return [], 0
 
-        for hit in hits:
-            if _should_stop():
-                raise StopIteration
+    def _process_keyword(self, session, keyword, ki, total, start_page=1):
+        saved_before = self.state.jobs_saved
+        page_num = max(1, start_page)
+        empty_streak = 0
 
-            job_id = hit.get("objectID")
-            if not job_id or job_id in self.processed:
+        while page_num <= MAX_PAGES and not _should_stop():
+            results, count = self._search_page(session, keyword, page_num)
+            if not results:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                page_num += 1
                 continue
-            if not is_usa_location(hit.get("location")):
-                continue
-            posted_ts = hit.get("date_posted_num")
-            if not is_within_24h_timestamp(posted_ts):
-                continue
+            empty_streak = 0
 
-            posted_label = format_posted_time(posted_ts) if posted_ts else hit.get("date_posted", "Recently")
-            if not posted_label:
-                continue
+            self._save_state(
+                current_page=page_num,
+                last_message=f"[{ki + 1}/{total}] {keyword} — page {page_num} ({count} matches)",
+                current_keyword=keyword,
+            )
+            logger.info("[%s/%s] %s page %s: %s ads", ki + 1, total, keyword, page_num, len(results))
 
-            self.processed.add(job_id)
-            self._human_delay(0.12, 0.35)
+            for ad in results:
+                if _should_stop():
+                    raise StopIteration
 
-            apply_url = self._extract_apply_url(page, context, hit)
-            if not apply_url:
-                self.state.jobs_skipped += 1
-                logger.info("Skipped (no valid ATS): %s @ %s", hit.get("title"), hit.get("company"))
-                self._save_state(jobs_skipped=self.state.jobs_skipped)
-                continue
+                job_id = str(ad.get("id") or "")
+                if not job_id or job_id in self.processed:
+                    continue
+                if not is_usa_job(ad.get("location")):
+                    continue
 
-            title = (hit.get("title") or "").strip()
-            company = (hit.get("company") or "").strip()
-            location = (hit.get("location") or "United States").strip()
+                title = (ad.get("title") or "").strip()
+                description = ad.get("description") or ""
+                if not is_experience_0_to_5(title, description):
+                    continue
 
-            if job_exists(title, company, location, apply_url):
-                self.state.jobs_skipped += 1
-                self._save_state(jobs_skipped=self.state.jobs_skipped)
-                continue
+                posted_ts = _parse_created_ts(ad.get("created"))
+                if not posted_ts or not is_within_24h_timestamp(posted_ts):
+                    continue
 
-            close_old_connections()
-            try:
-                MigratemateJob.objects.create(
-                    title=title,
-                    company=company,
-                    location=location,
-                    apply_url=apply_url,
-                    source="MigrateMate",
-                    keyword=label,
-                    posted_time=posted_label,
-                    posted_at=int(posted_ts) if posted_ts else int(time.time()),
-                    migratemate_job_id=job_id,
-                )
-            except IntegrityError:
-                self.state.jobs_skipped += 1
-                self._save_state(jobs_skipped=self.state.jobs_skipped)
-                logger.info("Duplicate skipped (DB): %s", apply_url[:80])
-                continue
+                posted_label = format_posted_time(posted_ts)
+                if not posted_label:
+                    continue
 
-            self.state.jobs_saved += 1
-            self._save_state(jobs_saved=self.state.jobs_saved)
-            logger.info("Saved: %s @ %s (%s)", title, company, posted_label)
+                company = (ad.get("company") or {}).get("display_name") or ""
+                company = company.strip() or "Unknown"
+                loc = ad.get("location") or {}
+                location = (loc.get("display_name") or "").strip() or "United States"
+                if not is_usa_location_string(location):
+                    continue
+
+                redirect = ad.get("redirect_url") or ""
+                desc = ad.get("description") or ""
+                desc_candidates = []
+                for m in ATS_URL_IN_TEXT.finditer(desc):
+                    u = m.group(0).rstrip(".,;)'\"")
+                    if not is_blocked_apply_host(u) and is_valid_apply_url(u):
+                        desc_candidates.append(u)
+                apply_url = _pick_live_apply(session, desc_candidates)
+                if not apply_url:
+                    apply_url = _resolve_apply_url(
+                        session, redirect, title, company, self._gh_cache, self._lever_cache
+                    )
+                if not apply_url:
+                    self.processed.add(job_id)
+                    self.state.jobs_skipped += 1
+                    logger.info("Skipped (no valid ATS): %s @ %s", title, company)
+                    self._save_state(jobs_skipped=self.state.jobs_skipped)
+                    continue
+
+                if job_exists(title, company, location, apply_url, adzuna_job_id=job_id):
+                    self.processed.add(job_id)
+                    self.state.jobs_skipped += 1
+                    self._save_state(jobs_skipped=self.state.jobs_skipped)
+                    continue
+
+                close_old_connections()
+                try:
+                    MigratemateJob.objects.create(
+                        title=title,
+                        company=company,
+                        location=location,
+                        apply_url=apply_url,
+                        source="Adzuna",
+                        keyword=keyword,
+                        posted_time=posted_label,
+                        posted_at=posted_ts,
+                        migratemate_job_id=job_id,
+                    )
+                except IntegrityError:
+                    self.processed.add(job_id)
+                    self.state.jobs_skipped += 1
+                    self._save_state(jobs_skipped=self.state.jobs_skipped)
+                    continue
+
+                self.processed.add(job_id)
+                self.state.jobs_saved += 1
+                self._save_state(jobs_saved=self.state.jobs_saved)
+                logger.info("Saved: %s @ %s (%s)", title, company, posted_label)
+
+            page_num += 1
+            self._human_delay(0.1, 0.2)
 
         return self.state.jobs_saved - saved_before
 
     def run(self):
-        global _active_browser
         os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
         close_old_connections()
         keywords = list(settings.KEYWORDS)
-        work_items = []
-        if BROWSE_EMPTY_QUERY:
-            work_items.append(("", BROWSE_KEYWORD_LABEL))
-        work_items.extend((k, k) for k in keywords)
-        total = len(work_items)
+        total = len(keywords)
         start_idx = self.state.keyword_index if self.resume else 0
+
+        if not self.app_id or not self.app_key:
+            self._save_state(
+                status=MigratemateScraperState.STATUS_STOPPED,
+                last_message="Missing ADZUNA_APP_ID / ADZUNA_APP_KEY — register at developer.adzuna.com",
+            )
+            logger.error("Adzuna API credentials missing")
+            return
 
         if not self.resume:
             self.processed.clear()
@@ -809,99 +544,71 @@ class MigratemateScraper:
                 current_page=1,
                 jobs_saved=0,
                 jobs_skipped=0,
-                last_message=f"MigrateMate scraper started — {total} search passes",
+                last_message=f"Adzuna scraper started — {total} keywords",
             )
         else:
-            kw = self.state.current_keyword or (
-                work_items[start_idx][1] if start_idx < total else ""
-            )
+            self._hydrate_processed_from_db()
+            kw = self.state.current_keyword or (keywords[start_idx] if start_idx < total else "")
+            db_n = MigratemateJob.objects.count()
             self._save_state(
                 status=MigratemateScraperState.STATUS_RUNNING,
-                last_message=f"Resuming pass {start_idx + 1}/{total}: '{kw}'",
+                jobs_saved=db_n,
+                last_message=f"Resume — {db_n} jobs kept, no overwrite, keyword {start_idx + 1}/{total}: '{kw}'",
             )
 
-        logger.info("MigrateMate scraper started resume=%s idx=%s", self.resume, start_idx + 1)
+        logger.info("Adzuna scraper started resume=%s idx=%s", self.resume, start_idx + 1)
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
 
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
-                with _active_lock:
-                    _active_browser = browser
-
-                for ki in range(start_idx, total):
-                    self._check_stop()
-                    query, label = work_items[ki]
-                    context = browser.new_context(user_agent=USER_AGENT, locale="en-US", viewport={"width": 1400, "height": 900})
-                    page = context.new_page()
-                    self._session_ready = False
-
-                    try:
-                        self._save_state(
-                            current_keyword=label,
-                            keyword_index=ki,
-                            current_page=1,
-                            last_message=f"[{ki + 1}/{total}] Searching: {label}",
-                        )
-                        n = self._process_keyword(page, context, query, ki, total, display_keyword=label)
-                        self._save_state(
-                            keyword_index=ki + 1,
-                            current_page=1,
-                            last_message=f"[{ki + 1}/{total}] Done '{label}' (+{n} jobs)",
-                        )
-                    except StopIteration:
-                        raise
-                    except Exception as exc:
-                        logger.exception("Keyword error %s: %s", label, exc)
-                        self._save_state(
-                            keyword_index=ki + 1,
-                            last_message=f"Error on '{label}': {str(exc)[:120]}",
-                        )
-                    finally:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-                        self.resume = False
-                        if not _should_stop():
-                            self._human_delay(0.5, 1.0)
+            for ki in range(start_idx, total):
+                self._check_stop()
+                keyword = keywords[ki]
+                start_page = 1
+                if self.resume and self.state.current_keyword == keyword and self.state.current_page > 1:
+                    start_page = self.state.current_page
 
                 try:
-                    browser.close()
-                except Exception:
-                    pass
-                with _active_lock:
-                    _active_browser = None
-
-                if not _should_stop():
+                    self._save_state(keyword_index=ki, current_keyword=keyword)
+                    n = self._process_keyword(session, keyword, ki, total, start_page=start_page)
                     self._save_state(
-                        status=MigratemateScraperState.STATUS_IDLE,
-                        keyword_index=total,
-                        current_keyword="",
-                        last_message=f"Completed all {total} MigrateMate keywords",
+                        keyword_index=ki + 1,
+                        current_page=1,
+                        last_message=f"[{ki + 1}/{total}] Done '{keyword}' (+{n} jobs)",
                     )
+                except StopIteration:
+                    raise
+                except Exception as exc:
+                    logger.exception("Keyword error %s: %s", keyword, exc)
+                    self._save_state(
+                        keyword_index=ki + 1,
+                        last_message=f"Error on '{keyword}': {str(exc)[:120]}",
+                    )
+                self.resume = False
+                if not _should_stop():
+                    self._human_delay(0.15, 0.3)
 
+            if not _should_stop():
+                self._save_state(
+                    status=MigratemateScraperState.STATUS_IDLE,
+                    keyword_index=total,
+                    current_keyword="",
+                    last_message=f"Completed all {total} Adzuna keywords",
+                )
         except StopIteration:
-            kw = self.state.current_keyword or "—"
-            ki = self.state.keyword_index
             self._save_state(
                 status=MigratemateScraperState.STATUS_STOPPED,
-                keyword_index=ki,
-                last_message=f"Stopped — Resume continues keyword {ki + 1}: '{kw}' (no duplicates)",
+                last_message=f"Stopped — Resume continues keyword {self.state.keyword_index + 1}",
             )
-            logger.info("MigrateMate stopped at keyword %s", kw)
         except Exception as exc:
-            if _should_stop():
-                self._save_state(status=MigratemateScraperState.STATUS_STOPPED, last_message="Stopped by user")
-            else:
-                self._save_state(status=MigratemateScraperState.STATUS_STOPPED, last_message=str(exc)[:500])
-                logger.exception("MigrateMate scraper error: %s", exc)
-        finally:
-            _close_active_browser()
+            if not _should_stop():
+                logger.exception("Adzuna scraper error: %s", exc)
+            self._save_state(status=MigratemateScraperState.STATUS_STOPPED, last_message=str(exc)[:500])
 
 
 def start_scraper(resume=False):
     if is_scraper_running():
-        return False, "MigrateMate scraper already running (separate process)"
+        return False, "Adzuna scraper already running"
 
     clear_stop_flag()
     _stop_event.clear()
@@ -918,34 +625,27 @@ def start_scraper(resume=False):
         state.jobs_skipped = 0
         state.processed_ids = ""
         state.last_message = f"Fresh start — deleted {deleted} jobs, keyword 1/{total}"
-        start_msg = f"Started fresh: cleared {deleted} jobs, keyword 1/{total}"
+        start_msg = f"Started fresh: cleared {deleted} jobs"
     else:
         state.status = MigratemateScraperState.STATUS_RUNNING
-        kw = state.current_keyword or "—"
-        idx = state.keyword_index
-        state.last_message = f"Resuming keyword {idx + 1}/{total}: '{kw}' (no duplicates)"
         start_msg = None
 
     pid = spawn_worker(resume=resume)
     state.worker_pid = pid
     state.save()
-    if start_msg:
-        return True, start_msg
-    return True, f"Resumed (PID {pid}) — continues from saved keyword"
+    return True, start_msg or f"Resumed — existing jobs kept, no duplicates (PID {pid})"
 
 
 def stop_scraper():
     state = MigratemateScraperState.get_singleton()
     if not is_scraper_running() and state.status != MigratemateScraperState.STATUS_RUNNING:
-        return True, "MigrateMate scraper is not running"
+        return True, "Scraper is not running"
 
     request_stop()
     _stop_event.set()
     terminate_pid(state.worker_pid)
     state.worker_pid = 0
-    kw = state.current_keyword or "—"
-    idx = state.keyword_index
     state.status = MigratemateScraperState.STATUS_STOPPED
-    state.last_message = f"Stopped — click Resume for keyword {idx + 1}: '{kw}'"
+    state.last_message = "Stopped — click Resume to continue"
     state.save()
     return True, state.last_message
