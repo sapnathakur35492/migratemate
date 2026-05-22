@@ -28,10 +28,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Secrets (keep .env.example in repo)
-.env
+# Local overrides only (optional)
 .env.local
-!.env.example
 
 # Local probes (dev only)
 _probe*.py

@@ -42,7 +42,7 @@ Or use `start_server.bat` (after `.env` is configured).
 | `ADZUNA_APP_KEY` | Yes | Adzuna API key |
 | `DJANGO_SECRET_KEY` | No | Production secret (optional in dev) |
 
-Never commit `.env` — use `.env.example` as a template.
+Copy `.env` from the repo (or `.env.example`) and set your Adzuna keys on a new machine.
 
 ## Dashboard actions
 
@@ -95,12 +95,11 @@ MigrateMate_new/
 
 ## Git push checklist
 
-- [ ] `.env` is **not** staged (listed in `.gitignore`)
 - [ ] `db.sqlite3` and `logs/` are **not** staged
-- [ ] `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` only in local `.env`
+- [ ] `.env` included if you want easy setup on another PC (contains API keys — private repo recommended)
 
 ```powershell
-git add README.md requirements.txt .env.example
+git add README.md requirements.txt .env .env.example
 git add migratemate migratemate_site manage.py start_server.bat .gitignore
 git commit -m "Adzuna USA scraper: dashboard, CSV export, resume without duplicates"
 git push
